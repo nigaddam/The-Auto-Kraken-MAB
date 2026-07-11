@@ -695,6 +695,15 @@ async function canArmLiveAutoClose(): Promise<LiveAutoClosePreflightResult> {
     blockers.push("Latest public market-data refresh is stale.");
   }
 
+  // A symbol can be tracked as an active position before the next scheduled
+  // market-data-refresh timer catches up to include it (that timer runs
+  // independently of position scans), which would otherwise wrongly block
+  // arming with "no public market row" for a perfectly fine, just-newly-
+  // detected symbol. Force one refresh here, scoped to whatever symbols are
+  // active right now, so the check below sees current data.
+  await refreshMarketData({ automatic: false });
+  state = await getState();
+
   const active = activeAutoClosePositions(state);
   if (active.length === 0) blockers.push("No auto-close-eligible active LONG positions exist.");
   for (const pos of active) {
@@ -1235,7 +1244,7 @@ async function evaluatePositions(
   return next;
 }
 
-async function processLiveAutoClose(state: RuntimeState): Promise<void> {
+async function processLiveAutoClose(initialState: RuntimeState): Promise<void> {
   if (autoCloseInFlight) return;
   // Defense in depth: the in-memory flag above is the primary lock, but it
   // does not survive a service-worker restart mid-execution. The persisted
@@ -1244,199 +1253,255 @@ async function processLiveAutoClose(state: RuntimeState): Promise<void> {
   // (resetToSafeDefaultsOnRestart also independently detects and marks any
   // such interrupted record UNCERTAIN on the next restart; this check
   // covers the window before that has a chance to run.)
-  if (state.closeExecution && !isExecutionTerminal(state.closeExecution.state)) return;
-  const now = Date.now();
-  if (
-    state.monitoringStatus !== "RUNNING" ||
-    state.executionMode !== "ARMED_AUTO_CLOSE" ||
-    !state.autoCloseLive ||
-    state.armedUntil === null ||
-    state.armedUntil <= now
-  ) {
+  if (initialState.closeExecution && !isExecutionTerminal(initialState.closeExecution.state))
     return;
-  }
-
-  const candidate = Object.values(state.positions).find(
-    (pos) =>
-      pos.status === "ACTIVE" &&
-      pos.decision === "CLOSE" &&
-      !pos.autoCloseDisabledReason &&
-      !state.autoCloseDryRunIntents[pos.fingerprint]
-  );
-  if (!candidate) return;
-
-  const recentCloses = state.liveAutoCloseStats.closeTimestamps.filter(
-    (ts) => now - ts < 60 * 60_000
-  );
-  if (recentCloses.length >= state.settings.maxLiveClosesPerHour) {
-    await disarmLiveAutoClose(
-      `Hourly live close limit reached (${state.settings.maxLiveClosesPerHour}).`
-    );
-    return;
-  }
-  if (state.liveAutoCloseStats.closesThisSession >= state.settings.maxLiveClosesPerArmedSession) {
-    await disarmLiveAutoClose(
-      `Armed-session live close limit reached (${state.settings.maxLiveClosesPerArmedSession}).`
-    );
-    return;
-  }
-
-  const tab = await findKrakenTab();
-  if (!tab || tab.id === undefined) {
-    await disarmLiveAutoClose("Auto-Close disarmed: Kraken tab missing before live execution.");
-    return;
-  }
 
   autoCloseInFlight = true;
-  const intentId = `${candidate.symbol}-${candidate.fingerprint}-${now}`;
-  const beforeFingerprints = Object.values(state.positions)
-    .filter((pos) => pos.status === "ACTIVE")
-    .map((pos) => pos.fingerprint);
   try {
-    const intent: CloseExecutionRecord = {
-      intentId,
-      fingerprint: candidate.fingerprint,
-      symbol: candidate.symbol,
-      lotLabel: null,
-      trigger: candidate.reason,
-      startedAt: now,
-      updatedAt: now,
-      state: "CREATED",
-      result: null,
-      details: ["Live Auto-Close intent created."],
-    };
-    await updateState((s) => ({
-      ...s,
-      autoCloseDryRunIntents: { ...s.autoCloseDryRunIntents, [candidate.fingerprint]: now },
-      closeExecution: intent,
-    }));
-    await appendAuditEntry(
-      makeAuditEntry(
-        state,
-        "AUTO_CLOSE_EXECUTION_STARTED",
-        `Live Auto-Close started: ${candidate.reason}`,
-        {
-          symbol: candidate.symbol,
-          fingerprint: candidate.fingerprint,
-          entryPrice: candidate.openingPrice,
-          currentPrice: candidate.latestApiPrice,
-          currentReturnPct:
-            candidate.latestApiPrice !== null
-              ? computeCurrentReturnPct(candidate.openingPrice, candidate.latestApiPrice)
-              : null,
-          peakReturnPct: candidate.peakReturnPct,
-          profitFloorPct: candidate.profitFloorPct,
-          smaFast: candidate.smaFast,
-          smaSlow: candidate.smaSlow,
-          closeCounter: candidate.consecutiveClosesBelowSmaFast,
-          decision: candidate.decision,
-        }
-      )
-    );
+    // Processes every currently qualifying CLOSE candidate this cycle, not
+    // just the first. Each iteration re-derives `state` from the previous
+    // iteration's post-close, freshly-verified scan (verifyCloseSubmitted
+    // already rescans the whole page before confirming SUCCESS) before
+    // picking the next candidate — so no two closes are ever attempted
+    // against stale DOM/position data, even though several may happen in
+    // quick succession within one cycle.
+    let state = initialState;
+    for (;;) {
+      const now = Date.now();
+      if (
+        state.monitoringStatus !== "RUNNING" ||
+        state.executionMode !== "ARMED_AUTO_CLOSE" ||
+        !state.autoCloseLive ||
+        state.armedUntil === null ||
+        state.armedUntil <= now
+      ) {
+        return;
+      }
 
-    await updateCloseExecution({
-      state: "DIALOG_OPENING",
-      details: ["Opening Kraken close dialog."],
-    });
-    const openRaw = await sendMessageToKrakenTab(tab.id, {
-      type: "OPEN_CLOSE_DIALOG",
-      fingerprint: candidate.fingerprint,
-      symbol: candidate.symbol,
-      lotLabel: null,
-    });
-    if (
-      !isExtensionMessage(openRaw) ||
-      openRaw.type !== "OPEN_CLOSE_DIALOG_RESULT" ||
-      !openRaw.report?.ready
-    ) {
-      await updateCloseExecution({
-        state: "BLOCKED",
-        result: "BLOCKED",
-        details: ["Could not validate close dialog."],
-      });
-      await disarmLiveAutoClose(
-        `Auto-Close disarmed: could not validate close dialog for ${candidate.symbol}. ${
-          isExtensionMessage(openRaw) && openRaw.type === "OPEN_CLOSE_DIALOG_RESULT"
-            ? (openRaw.report?.blockedReason ?? openRaw.error ?? "")
-            : "Unexpected response."
-        }`
+      const candidate = Object.values(state.positions).find(
+        (pos) =>
+          pos.status === "ACTIVE" &&
+          pos.decision === "CLOSE" &&
+          !pos.autoCloseDisabledReason &&
+          !state.autoCloseDryRunIntents[pos.fingerprint]
       );
-      return;
-    }
+      if (!candidate) return;
 
-    await updateCloseExecution({
-      state: "MODAL_VALIDATED",
-      details: ["Kraken close modal validated."],
-    });
-    await updateCloseExecution({
-      state: "FINAL_SUBMITTING",
-      details: ["Fresh revalidation running before final submit."],
-    });
-    const revalidated = await revalidateCloseCandidateBeforeSubmit(intent, tab.id);
-    if (!revalidated.ok) {
-      await updateCloseExecution({
-        state: "BLOCKED",
-        result: "BLOCKED",
-        details: [revalidated.reason],
-      });
-      await appendAuditEntry(
-        makeAuditEntry(state, "AUTO_CLOSE_BLOCKED", revalidated.reason, {
-          symbol: candidate.symbol,
-          fingerprint: candidate.fingerprint,
-          executionResult: "BLOCKED",
-          errorDetails: revalidated.reason,
-        })
+      const recentCloses = state.liveAutoCloseStats.closeTimestamps.filter(
+        (ts) => now - ts < 60 * 60_000
       );
-      await disarmLiveAutoClose(`Auto-Close disarmed before final submit: ${revalidated.reason}`);
-      return;
-    }
+      if (recentCloses.length >= state.settings.maxLiveClosesPerHour) {
+        await disarmLiveAutoClose(
+          `Hourly live close limit reached (${state.settings.maxLiveClosesPerHour}).`
+        );
+        return;
+      }
+      if (
+        state.liveAutoCloseStats.closesThisSession >= state.settings.maxLiveClosesPerArmedSession
+      ) {
+        await disarmLiveAutoClose(
+          `Armed-session live close limit reached (${state.settings.maxLiveClosesPerArmedSession}).`
+        );
+        return;
+      }
 
-    await updateCloseExecution({
-      state: "VERIFYING",
-      details: ["Final close submitted. Verifying exact lot removal."],
-    });
-    const verification = await verifyCloseSubmitted(tab.id, candidate, beforeFingerprints);
-    const verified = await getState();
-    if (verification.ok) {
-      const done = await updateState((s) => ({
+      const tab = await findKrakenTab();
+      if (!tab || tab.id === undefined) {
+        await disarmLiveAutoClose("Auto-Close disarmed: Kraken tab missing before live execution.");
+        return;
+      }
+
+      const intentId = `${candidate.symbol}-${candidate.fingerprint}-${now}`;
+      const beforeFingerprints = Object.values(state.positions)
+        .filter((pos) => pos.status === "ACTIVE")
+        .map((pos) => pos.fingerprint);
+      const intent: CloseExecutionRecord = {
+        intentId,
+        fingerprint: candidate.fingerprint,
+        symbol: candidate.symbol,
+        lotLabel: null,
+        trigger: candidate.reason,
+        startedAt: now,
+        updatedAt: now,
+        state: "CREATED",
+        result: null,
+        details: ["Live Auto-Close intent created."],
+      };
+      await updateState((s) => ({
         ...s,
-        closeExecution: s.closeExecution
-          ? {
-              ...s.closeExecution,
-              state: "SUCCEEDED",
-              result: "SUCCESS",
-              details: verification.details,
-              updatedAt: Date.now(),
-            }
-          : s.closeExecution,
-        liveAutoCloseStats: {
-          ...s.liveAutoCloseStats,
-          closesThisSession: s.liveAutoCloseStats.closesThisSession + 1,
-          closeTimestamps: [...recentCloses, Date.now()],
-        },
+        autoCloseDryRunIntents: { ...s.autoCloseDryRunIntents, [candidate.fingerprint]: now },
+        closeExecution: intent,
       }));
       await appendAuditEntry(
         makeAuditEntry(
-          done,
-          "AUTO_CLOSE_SUCCEEDED",
-          `${candidate.symbol} live Auto-Close verified.`,
+          state,
+          "AUTO_CLOSE_EXECUTION_STARTED",
+          `Live Auto-Close started: ${candidate.reason}`,
           {
             symbol: candidate.symbol,
             fingerprint: candidate.fingerprint,
-            executionResult: "SUCCESS",
+            entryPrice: candidate.openingPrice,
+            currentPrice: candidate.latestApiPrice,
+            currentReturnPct:
+              candidate.latestApiPrice !== null
+                ? computeCurrentReturnPct(candidate.openingPrice, candidate.latestApiPrice)
+                : null,
+            peakReturnPct: candidate.peakReturnPct,
+            profitFloorPct: candidate.profitFloorPct,
+            smaFast: candidate.smaFast,
+            smaSlow: candidate.smaSlow,
+            closeCounter: candidate.consecutiveClosesBelowSmaFast,
+            decision: candidate.decision,
+          }
+        )
+      );
+
+      await updateCloseExecution({
+        state: "DIALOG_OPENING",
+        details: ["Opening Kraken close dialog."],
+      });
+      const openRaw = await sendMessageToKrakenTab(tab.id, {
+        type: "OPEN_CLOSE_DIALOG",
+        fingerprint: candidate.fingerprint,
+        symbol: candidate.symbol,
+        lotLabel: null,
+      });
+      if (
+        !isExtensionMessage(openRaw) ||
+        openRaw.type !== "OPEN_CLOSE_DIALOG_RESULT" ||
+        !openRaw.report?.ready
+      ) {
+        await updateCloseExecution({
+          state: "BLOCKED",
+          result: "BLOCKED",
+          details: ["Could not validate close dialog."],
+        });
+        await disarmLiveAutoClose(
+          `Auto-Close disarmed: could not validate close dialog for ${candidate.symbol}. ${
+            isExtensionMessage(openRaw) && openRaw.type === "OPEN_CLOSE_DIALOG_RESULT"
+              ? (openRaw.report?.blockedReason ?? openRaw.error ?? "")
+              : "Unexpected response."
+          }`
+        );
+        return;
+      }
+
+      await updateCloseExecution({
+        state: "MODAL_VALIDATED",
+        details: ["Kraken close modal validated."],
+      });
+      await updateCloseExecution({
+        state: "FINAL_SUBMITTING",
+        details: ["Fresh revalidation running before final submit."],
+      });
+      const revalidated = await revalidateCloseCandidateBeforeSubmit(intent, tab.id);
+      if (!revalidated.ok) {
+        await updateCloseExecution({
+          state: "BLOCKED",
+          result: "BLOCKED",
+          details: [revalidated.reason],
+        });
+        await appendAuditEntry(
+          makeAuditEntry(state, "AUTO_CLOSE_BLOCKED", revalidated.reason, {
+            symbol: candidate.symbol,
+            fingerprint: candidate.fingerprint,
+            executionResult: "BLOCKED",
+            errorDetails: revalidated.reason,
+          })
+        );
+        await disarmLiveAutoClose(`Auto-Close disarmed before final submit: ${revalidated.reason}`);
+        return;
+      }
+
+      await updateCloseExecution({
+        state: "VERIFYING",
+        details: ["Final close submitted. Verifying exact lot removal."],
+      });
+      const verification = await verifyCloseSubmitted(tab.id, candidate, beforeFingerprints);
+      const verified = await getState();
+      if (verification.ok) {
+        const done = await updateState((s) => ({
+          ...s,
+          closeExecution: s.closeExecution
+            ? {
+                ...s.closeExecution,
+                state: "SUCCEEDED",
+                result: "SUCCESS",
+                details: verification.details,
+                updatedAt: Date.now(),
+              }
+            : s.closeExecution,
+          liveAutoCloseStats: {
+            ...s.liveAutoCloseStats,
+            closesThisSession: s.liveAutoCloseStats.closesThisSession + 1,
+            closeTimestamps: [...recentCloses, Date.now()],
+          },
+        }));
+        await appendAuditEntry(
+          makeAuditEntry(
+            done,
+            "AUTO_CLOSE_SUCCEEDED",
+            `${candidate.symbol} live Auto-Close verified.`,
+            {
+              symbol: candidate.symbol,
+              fingerprint: candidate.fingerprint,
+              executionResult: "SUCCESS",
+              errorDetails: verification.details.join("; "),
+            }
+          )
+        );
+        await notify(`${candidate.symbol} auto-closed`, "Live Auto-Close verified on Kraken.", {
+          urgent: true,
+        });
+        await sendExecutionWebhook(
+          done.settings.executionWebhookUrl,
+          {
+            symbol: candidate.symbol,
+            lotLabel: null,
+            result: "SUCCESS",
+            mode: "LIVE_AUTO_CLOSE",
+            reason: candidate.reason,
+            entryPrice: candidate.openingPrice,
+            currentPrice: candidate.latestApiPrice,
+            currentReturnPct: computeCurrentReturnPct(
+              candidate.openingPrice,
+              candidate.latestApiPrice ?? candidate.openingPrice
+            ),
+            details: verification.details,
+            timestamp: Date.now(),
+          },
+          done.settings.executionEmailAddress
+        );
+        // Look for any other qualifying candidate this same cycle, using the
+        // already-fresh, already-verified state from this close.
+        state = done;
+        continue;
+      }
+
+      await updateCloseExecution({
+        state: verification.uncertain ? "UNCERTAIN" : "FAILED",
+        result: verification.uncertain ? "UNCERTAIN" : "FAILURE",
+        details: verification.details,
+      });
+      await appendAuditEntry(
+        makeAuditEntry(
+          verified,
+          "CLOSE_FAILED",
+          `${candidate.symbol} Auto-Close uncertain; lot still appears active.`,
+          {
+            symbol: candidate.symbol,
+            fingerprint: candidate.fingerprint,
+            executionResult: "FAILURE",
             errorDetails: verification.details.join("; "),
           }
         )
       );
-      await notify(`${candidate.symbol} auto-closed`, "Live Auto-Close verified on Kraken.", {
-        urgent: true,
-      });
       await sendExecutionWebhook(
-        done.settings.executionWebhookUrl,
+        verified.settings.executionWebhookUrl,
         {
           symbol: candidate.symbol,
           lotLabel: null,
-          result: "SUCCESS",
+          result: verification.uncertain ? "UNCERTAIN" : "FAILURE",
           mode: "LIVE_AUTO_CLOSE",
           reason: candidate.reason,
           entryPrice: candidate.openingPrice,
@@ -1448,54 +1513,16 @@ async function processLiveAutoClose(state: RuntimeState): Promise<void> {
           details: verification.details,
           timestamp: Date.now(),
         },
-        done.settings.executionEmailAddress
+        verified.settings.executionEmailAddress
+      );
+      await disarmLiveAutoClose(
+        `Auto-Close disarmed: ${candidate.symbol} result uncertain after final click.`,
+        {
+          uncertain: true,
+        }
       );
       return;
     }
-
-    await updateCloseExecution({
-      state: verification.uncertain ? "UNCERTAIN" : "FAILED",
-      result: verification.uncertain ? "UNCERTAIN" : "FAILURE",
-      details: verification.details,
-    });
-    await appendAuditEntry(
-      makeAuditEntry(
-        verified,
-        "CLOSE_FAILED",
-        `${candidate.symbol} Auto-Close uncertain; lot still appears active.`,
-        {
-          symbol: candidate.symbol,
-          fingerprint: candidate.fingerprint,
-          executionResult: "FAILURE",
-          errorDetails: verification.details.join("; "),
-        }
-      )
-    );
-    await sendExecutionWebhook(
-      verified.settings.executionWebhookUrl,
-      {
-        symbol: candidate.symbol,
-        lotLabel: null,
-        result: verification.uncertain ? "UNCERTAIN" : "FAILURE",
-        mode: "LIVE_AUTO_CLOSE",
-        reason: candidate.reason,
-        entryPrice: candidate.openingPrice,
-        currentPrice: candidate.latestApiPrice,
-        currentReturnPct: computeCurrentReturnPct(
-          candidate.openingPrice,
-          candidate.latestApiPrice ?? candidate.openingPrice
-        ),
-        details: verification.details,
-        timestamp: Date.now(),
-      },
-      verified.settings.executionEmailAddress
-    );
-    await disarmLiveAutoClose(
-      `Auto-Close disarmed: ${candidate.symbol} result uncertain after final click.`,
-      {
-        uncertain: true,
-      }
-    );
   } finally {
     autoCloseInFlight = false;
   }

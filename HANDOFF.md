@@ -826,3 +826,69 @@ place in code (harmless no-op today), but sending will silently fail with
 that same error until/unless the user decides to set up a ntfy.sh account
 and an access token gets wired in as an `Authorization` header — not done
 in this pass, pending user decision.
+
+## 19. Addendum: real-world live-arming session — two bugs found and fixed (this session)
+
+The user armed LIVE Auto-Close for real (with real Kraken Prop positions:
+XPL, JTO, TIA) and hit two genuine blockers in sequence, each root-caused
+by reading the code rather than guessing, then fixed and verified:
+
+**1. Login false negative.** `canArmLiveAutoClose()` requires
+`pageHealth.sessionState === "LOGGED_IN"`, and `checkPageHealth()`
+(src/content/page-health.ts) only set that from a narrow, unvalidated CSS
+selector (`[data-testid*="account" i], [aria-label*="account" i]`) that
+didn't match this account's real markup — so it stayed `UNKNOWN` even
+though positions were clearly parsing correctly (which is only possible on
+an authenticated page). Fixed: `checkPageHealth` now takes a third param,
+`hasConfirmedPositions`, and upgrades `UNKNOWN` to `LOGGED_IN` when at
+least one real position parsed (never downgrades an actual detected
+logout) — mirrors a rule that already existed in the separate Diagnostics
+report (`diagnostics.ts`'s `loggedInState` computation) but had never been
+applied to the real scan path used for arming.
+`content-script.ts::buildScanResult` now passes `positions.length > 0`.
+Tests: two new cases in `tests/session-health.test.ts` (upgrade happens
+without an account marker; a real logout is never overridden).
+
+**2. Newly-tracked symbol blocked arming entirely.** Once login was fixed,
+arming failed with `"TIA: no public market row"` — TIA had only just
+become an active tracked position, and the separate Market Data table
+(`state.marketData`, which `canArmLiveAutoClose`'s per-position market
+check reads) only refreshes on its own independent timer
+(`marketRefreshMinutes`), not on every position scan. This isn't a one-off
+— it recurs any time a brand-new symbol appears between refresh cycles.
+Fixed: `canArmLiveAutoClose()` now forces one `refreshMarketData({
+automatic: false })` call (scoped to whatever's currently tracked) right
+before evaluating the per-position market-data blockers, so a newly
+detected symbol is always covered without waiting on the timer or a manual
+refresh click.
+
+**3. Design change, explicitly requested by the user:**
+`processLiveAutoClose()` previously found and executed exactly one
+qualifying CLOSE candidate per cycle, then returned — additional
+qualifying lots would each wait for a separate subsequent poll cycle. The
+user asked why, was given the reasoning (each close changes the Kraken
+DOM; deferring to a fresh scan+revalidation before acting on any other
+position avoids acting on stale DOM/position data, and doubles as a
+natural throttle), and after hearing it, explicitly chose to process all
+qualifying closes within one cycle instead. Reworked into a loop: after a
+successful close, `verifyCloseSubmitted`'s own rescan already yields a
+fresh, fully-reconciled position set (`done`), which becomes the next
+iteration's `state` before re-checking rate limits and picking the next
+candidate — so no two closes are ever attempted against stale data, they
+just happen back-to-back within one cycle now instead of one-per-cycle.
+Any failure/uncertain/blocked outcome, or hitting `maxLiveClosesPerHour`/
+`maxLiveClosesPerArmedSession`, still disarms and stops the whole batch
+immediately, exactly as before for a single candidate.
+**Not covered by an automated test** — exercising this loop end-to-end
+would require mocking `OPEN_CLOSE_DIALOG`/`CONFIRM_CLOSE_DIALOG`/
+`PREVIEW_CLOSE` content-script responses through the service-worker
+harness, which doesn't exist yet (falls into the same already-documented
+gap in §13: "deeper execution-path scenarios... remain code-reviewed, not
+test-automated"). Verified instead by careful code review of the control
+flow (loop termination via rate limits/no-candidate/any-failure, and that
+`state` is re-derived fresh each iteration) and by the full existing suite
+still passing unchanged.
+
+All four gates pass after all three fixes: `npm run typecheck`,
+`npm run lint`, `npm test` (180/180, unchanged from before this addendum —
+no regressions), `npm run build`.
