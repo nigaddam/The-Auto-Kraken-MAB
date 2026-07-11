@@ -50,7 +50,13 @@ export const DEFAULT_SETTINGS: Settings = {
    * of the box on this install; still editable/clearable in Settings. */
   executionWebhookUrl: "https://ntfy.sh/kraken-guard-nitgaddam-1992",
   executionEmailAddress: "",
+  watchlistCoins: [],
 };
+
+/** Hard cap on Settings.watchlistCoins — keeps the per-cycle public-API
+ * fetch cost (candles + ticker per symbol) bounded regardless of how many
+ * coins the user tries to enter. */
+export const MAX_WATCHLIST_COINS = 5;
 
 /** Profit-protection tiers: [peakReturnPctLowerBoundInclusive, giveback fraction retained]. */
 export const PROFIT_LOCK_TIERS = [

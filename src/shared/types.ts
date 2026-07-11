@@ -216,6 +216,11 @@ export interface Settings {
    * email service required. Subject to ntfy.sh's own free-tier email
    * rate limit. */
   executionEmailAddress: string;
+  /** Up to MAX_WATCHLIST_COINS uppercase symbols the user wants tracked for
+   * BUY signals only — entirely separate from open positions. Kraken is
+   * never auto-bought; this only sends a notification so the user can
+   * place a manual order themselves. */
+  watchlistCoins: string[];
 }
 
 export type AuditEventType =
@@ -248,7 +253,8 @@ export type AuditEventType =
   | "MONITOR_STALLED"
   | "MONITOR_RECOVERED"
   | "EXECUTION_INTERRUPTED_BY_RESTART"
-  | "TEST_NOTIFICATION";
+  | "TEST_NOTIFICATION"
+  | "BUY_SIGNAL_DETECTED";
 
 export interface LiveAutoClosePreflightResult {
   allowed: boolean;
@@ -360,6 +366,24 @@ export interface RuntimeState {
    * isn't double-reported as an "externally closed" notification. Pruned
    * of entries older than 1 hour on every scan. */
   recentlyClosedByExtension: Record<string, number>;
+  /** Per-watchlist-symbol golden-cross progress, keyed by symbol. Persisted
+   * so the "consecutive closes above SMA7" counter and the
+   * already-fired-this-episode flag survive service-worker restarts. */
+  watchlistSignals: Record<string, BuySignalState>;
+}
+
+/** Tracks golden-cross (SMA7 crosses above SMA30) progress for one
+ * watchlist symbol — entirely separate from TrackedPosition, since a
+ * watchlist coin has no open position. Mirrors TrackedPosition's
+ * consecutiveClosesBelowSmaFast/lastProcessedCandleTs pattern, inverted. */
+export interface BuySignalState {
+  consecutiveClosesAboveSmaFast: number;
+  lastProcessedCandleTs: number | null;
+  /** True once a golden-cross buy signal has already been confirmed and
+   * notified for the current STRONG-trend episode — prevents re-firing
+   * every cycle while the trend stays STRONG. Reset the moment the trend
+   * drops out of STRONG, so the next genuine crossover can fire again. */
+  signalFiredForThisEpisode: boolean;
 }
 
 /** One row per unique symbol (not per lot) for the read-only Market Data
