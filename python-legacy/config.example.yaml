@@ -1,0 +1,61 @@
+app:
+  dry_run: true
+  live_execution_enabled: false
+  database_path: "./data/kraken_guard.db"
+  screenshot_dir: "./data/screenshots"
+  log_dir: "./data/logs"
+  timezone: "America/Los_Angeles"
+
+market_data:
+  provider: "kraken_public"
+  poll_seconds: 30
+  use_completed_candles_only: true
+  max_data_age_minutes: 8
+  min_candles_required: 31
+  candle_history_size: 100
+
+execution:
+  account_id_env: "KRAKEN_PROP_ACCOUNT_ID"
+  base_url_env: "KRAKEN_PROP_BASE_URL"
+  require_runtime_arm: true
+  arm_duration_minutes: 480
+  signal_expiry_minutes: 10
+  max_closes_per_hour: 1
+  max_closes_per_day: 2
+  browser_headless: false
+  final_confirmation_enabled: false
+
+assets:
+  JTO:
+    enabled: true
+    data_symbol: "JTO/USD"
+    ui_symbol: "JTO"
+    route_symbol: "jto-usd"
+    expected_side: "LONG"
+    expected_value_min_usd: 400
+    expected_value_max_usd: 650
+    candle_interval_minutes: 5
+    fast_sma: 7
+    slow_sma: 30
+    strategy_mode: "CONFIRMED_BEARISH_CROSS"
+    confirmation_candles: 1
+    cooldown_minutes: 60
+
+  XPL:
+    enabled: true
+    data_symbol: "XPL/USD"
+    ui_symbol: "XPL"
+    route_symbol: "xpl-usd"
+    expected_side: "LONG"
+    expected_value_min_usd: 400
+    expected_value_max_usd: 650
+    candle_interval_minutes: 5
+    fast_sma: 7
+    slow_sma: 30
+    strategy_mode: "CONFIRMED_BEARISH_CROSS"
+    confirmation_candles: 1
+    cooldown_minutes: 60
+
+notifications:
+  macos: true
+  telegram: false

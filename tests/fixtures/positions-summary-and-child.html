@@ -1,0 +1,23 @@
+<section>
+  <h2>Open positions</h2>
+  <div role="table" aria-label="Open positions table">
+    <!-- Summary row: shows LONG/symbol text but has no Close control, so it
+         must not be double-counted alongside the expanded child row below. -->
+    <div role="row" data-testid="position-summary-jto">
+      <span data-testid="position-symbol">JTO</span>
+      <span>LONG</span>
+      <span data-testid="position-value">Value $500.00</span>
+    </div>
+
+    <div role="row" data-testid="position-row-jto-expanded">
+      <span data-testid="position-symbol">JTO</span>
+      <span>LONG</span>
+      <span data-testid="position-entry-price">Entry Price $0.618280</span>
+      <span data-testid="position-mark-price">Mark Price $0.598700</span>
+      <span data-testid="position-value">Value $500.00</span>
+      <span data-testid="position-upnl">UPnL -$15.75</span>
+      <span data-testid="position-net-pnl">Net PnL -$16.20</span>
+      <button aria-label="Close position">Close position</button>
+    </div>
+  </div>
+</section>
