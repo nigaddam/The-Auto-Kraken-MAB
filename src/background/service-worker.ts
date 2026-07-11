@@ -16,6 +16,7 @@ import type {
   ExtensionMessage,
   ConfirmCloseDialogResultMessage,
   OpenCloseDialogResultMessage,
+  OrderFormDiagnosticsResultMessage,
   PreviewCloseResultMessage,
   RefreshMarketDataResultMessage,
   ScanResultMessage,
@@ -51,7 +52,8 @@ import {
 import { notify } from "./notifications";
 import { releaseSystemKeepAwake, requestSystemKeepAwake } from "./power";
 import { checkStall } from "./watchdog";
-import { sendExecutionWebhook } from "./execution-notify";
+import { sendBuySignalWebhook, sendExecutionWebhook } from "./execution-notify";
+import { evaluateWatchlistBuySignals } from "./watchlist-buy-signals";
 
 let pendingManualPositionRefresh = false;
 let autoCloseInFlight = false;
@@ -1692,7 +1694,47 @@ async function refreshMarketData(options: {
     }
   }
 
-  await broadcastState(next);
+  if (next.settings.watchlistCoins.length > 0) {
+    const updates = await evaluateWatchlistBuySignals(next.settings, next.watchlistSignals);
+    const withSignals = await updateState((s) => ({
+      ...s,
+      watchlistSignals: {
+        ...s.watchlistSignals,
+        ...Object.fromEntries(updates.map((u) => [u.symbol, u.state])),
+      },
+    }));
+    for (const update of updates) {
+      if (!update.newlyConfirmed) continue;
+      await appendAuditEntry(
+        makeAuditEntry(withSignals, "BUY_SIGNAL_DETECTED", `${update.symbol} golden cross confirmed.`, {
+          symbol: update.symbol,
+          currentPrice: update.currentPrice,
+          smaFast: update.smaFast,
+          smaSlow: update.smaSlow,
+          closeCounter: update.state.consecutiveClosesAboveSmaFast,
+        })
+      );
+      await notify(
+        `BUY SIGNAL: ${update.symbol}`,
+        "Golden cross confirmed. This is informational only — place a manual order if you agree."
+      );
+      await sendBuySignalWebhook(
+        withSignals.settings.executionWebhookUrl,
+        {
+          symbol: update.symbol,
+          currentPrice: update.currentPrice,
+          smaFast: update.smaFast,
+          smaSlow: update.smaSlow,
+          consecutiveClosesAboveSmaFast: update.state.consecutiveClosesAboveSmaFast,
+          timestamp: Date.now(),
+        },
+        withSignals.settings.executionEmailAddress
+      );
+    }
+    await broadcastState(withSignals);
+  } else {
+    await broadcastState(next);
+  }
   return {
     type: "REFRESH_MARKET_DATA_RESULT",
     ok: failed.length === 0,
@@ -1834,6 +1876,9 @@ async function handleMessage(
     }
     case "RUN_DOM_DIAGNOSTICS":
       await handleRunDomDiagnostics(sendResponse);
+      break;
+    case "RUN_ORDER_FORM_DIAGNOSTICS":
+      await handleRunOrderFormDiagnostics(sendResponse);
       break;
     case "PREVIEW_CLOSE":
       await handlePreviewClose(message, sendResponse);
@@ -2153,6 +2198,49 @@ async function handleRunDomDiagnostics(sendResponse: (response?: unknown) => voi
   } catch (err) {
     const response: DomDiagnosticsResultMessage = {
       type: "DOM_DIAGNOSTICS_RESULT",
+      report: null,
+      error: `Could not reach the content script on the Kraken tab: ${String(err)}`,
+    };
+    sendResponse(response);
+  }
+}
+
+async function handleRunOrderFormDiagnostics(sendResponse: (response?: unknown) => void): Promise<void> {
+  const tab = await findKrakenTab();
+  if (!tab || tab.id === undefined) {
+    const response: OrderFormDiagnosticsResultMessage = {
+      type: "ORDER_FORM_DIAGNOSTICS_RESULT",
+      report: null,
+      error: "No Kraken Prop tab found. Open the Portfolio page and try again.",
+    };
+    sendResponse(response);
+    return;
+  }
+
+  try {
+    const raw: unknown = await sendMessageToKrakenTab(tab.id, { type: "RUN_ORDER_FORM_DIAGNOSTICS" });
+    if (isExtensionMessage(raw) && raw.type === "ORDER_FORM_DIAGNOSTICS_RESULT") {
+      console.log(
+        "[kraken-guard] Order-form diagnostics report received from content script:",
+        raw.report
+      );
+      await updateState((s) => ({
+        ...s,
+        krakenTabId: tab.id ?? s.krakenTabId,
+        lastContentScriptResponseAt: Date.now(),
+      }));
+      sendResponse(raw);
+    } else {
+      const response: OrderFormDiagnosticsResultMessage = {
+        type: "ORDER_FORM_DIAGNOSTICS_RESULT",
+        report: null,
+        error: "Unexpected response from the content script.",
+      };
+      sendResponse(response);
+    }
+  } catch (err) {
+    const response: OrderFormDiagnosticsResultMessage = {
+      type: "ORDER_FORM_DIAGNOSTICS_RESULT",
       report: null,
       error: `Could not reach the content script on the Kraken tab: ${String(err)}`,
     };

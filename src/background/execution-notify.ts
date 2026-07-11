@@ -1,10 +1,12 @@
 /** Sends a notification to an external channel (phone via the free ntfy.sh
- * push service by default) — and ONLY when a close execution reaches a
- * terminal outcome. Never called for monitoring start/stop, strategy
- * signals, arming, stall/health events, or anything else — see the four
- * call sites in service-worker.ts (AUTO_CLOSE_SUCCEEDED, CLOSE_FAILED /
- * AUTO_CLOSE_UNCERTAIN, MANUAL_POSITION_CLOSE_SUCCEEDED, and the manual
- * equivalent of CLOSE_FAILED).
+ * push service by default). Two distinct kinds, never confused:
+ * `sendExecutionWebhook` fires ONLY when a close execution reaches a
+ * terminal outcome (see the four call sites in service-worker.ts:
+ * AUTO_CLOSE_SUCCEEDED, CLOSE_FAILED / AUTO_CLOSE_UNCERTAIN,
+ * MANUAL_POSITION_CLOSE_SUCCEEDED, and the manual equivalent of
+ * CLOSE_FAILED); `sendBuySignalWebhook` fires ONLY when a watchlist
+ * symbol's golden cross is newly confirmed. Neither ever fires for
+ * monitoring start/stop, arming, or stall/health events.
  *
  * Scoped to ntfy.sh for now: it's the only origin declared in
  * host_permissions, so it works with zero extra permission prompts and no
@@ -98,5 +100,65 @@ export async function sendExecutionWebhook(
     await fetch(webhookUrl, { method: "POST", headers, body });
   } catch (err) {
     console.warn("[kraken-guard] execution webhook failed", err);
+  }
+}
+
+/** Buy-signal notifications are purely informational — Kraken is never
+ * auto-bought, this only tells the user a watchlist coin's golden cross
+ * confirmed so they can place a manual order themselves. Deliberately
+ * distinct Title prefix/tag/priority from execution notifications so the
+ * two are never confused, even though both may share the same ntfy topic. */
+export interface BuySignalNotificationDetails {
+  symbol: string;
+  currentPrice: number | null;
+  smaFast: number | null;
+  smaSlow: number | null;
+  consecutiveClosesAboveSmaFast: number;
+  timestamp: number;
+}
+
+export function buildBuySignalTitle(d: BuySignalNotificationDetails): string {
+  return `BUY SIGNAL: ${d.symbol}`;
+}
+
+export function buildBuySignalBody(d: BuySignalNotificationDetails): string {
+  const lines = [
+    `Symbol: ${d.symbol}`,
+    `Pattern: Golden cross (SMA7 > SMA30), confirmed after ${d.consecutiveClosesAboveSmaFast} completed closes above SMA7`,
+  ];
+  if (d.currentPrice !== null) lines.push(`Current price: ${d.currentPrice}`);
+  if (d.smaFast !== null) lines.push(`SMA7: ${d.smaFast}`);
+  if (d.smaSlow !== null) lines.push(`SMA30: ${d.smaSlow}`);
+  lines.push(`Time: ${new Date(d.timestamp).toLocaleString()}`);
+  lines.push("Informational only — no order was placed. Place a manual buy on Kraken if you agree.");
+  return lines.join("\n");
+}
+
+export async function sendBuySignalWebhook(
+  webhookUrl: string,
+  details: BuySignalNotificationDetails,
+  emailAddress = ""
+): Promise<void> {
+  if (!webhookUrl) return;
+  if (!isSupportedExecutionWebhookUrl(webhookUrl)) {
+    console.warn(`[kraken-guard] executionWebhookUrl is not an ntfy.sh URL, skipping: ${webhookUrl}`);
+    return;
+  }
+
+  const title = buildBuySignalTitle(details);
+  const body = buildBuySignalBody(details);
+  const headers: Record<string, string> = {
+    Title: title,
+    Priority: "high",
+    Tags: "moneybag",
+  };
+  if (emailAddress && isPlausibleEmailAddress(emailAddress)) {
+    headers["X-Email"] = emailAddress;
+  }
+
+  try {
+    await fetch(webhookUrl, { method: "POST", headers, body });
+  } catch (err) {
+    console.warn("[kraken-guard] buy signal webhook failed", err);
   }
 }

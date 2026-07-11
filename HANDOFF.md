@@ -892,3 +892,154 @@ still passing unchanged.
 All four gates pass after all three fixes: `npm run typecheck`,
 `npm run lint`, `npm test` (180/180, unchanged from before this addendum —
 no regressions), `npm run build`.
+
+## 20. Addendum: crash-protection honesty check + "Interested Kraken Coins" watchlist (this session)
+
+**Crash-protection question, answered honestly, no code change:** the user
+asked whether they're protected in a worldwide crypto-crash scenario.
+Answered directly rather than reassuringly: the ATR-based hard-loss stop
+(`hardLossFallbackPct`/`hardLossAtrMultiple`, clamped between
+`hardLossMinDistancePct` and `hardLossMaxDistancePct`) requires
+`hardLossRequiredObservations` (2) separate scan-cycle observations before
+confirming — meaning detection can lag several minutes, and a brief
+whipsaw recovery resets the counter entirely. More importantly: this is a
+software bot polling a browser tab. It has zero protection if the laptop
+sleeps, the lid closes, wifi drops, Chrome crashes, or the Kraken tab
+closes — there is no exchange-side order sitting on Kraken independent of
+this extension. Recommended the user also consider Kraken's own native
+TP/SL orders (visible in their own UI) as a true, laptop-independent
+backstop; this extension is a helpful layer on top of judgment, not a
+replacement for that.
+
+**New feature, explicitly requested:** a read-only "Interested Kraken
+Coins" watchlist (up to `MAX_WATCHLIST_COINS` = 5, `src/shared/constants.ts`),
+entirely separate from open positions, that sends a distinctly different
+"BUY SIGNAL" notification when a golden cross (SMA7 crosses above SMA30,
+confirmed over `strongTrendConfirmationCloses` completed closes) fires.
+**Never places an order** — Kraken cannot be auto-bought by design; the
+user was explicit about this ("Kraken cant auto buy obviously i will
+place a human order"). The buy-signal criterion (golden cross, mirroring
+the existing exit-side trend-break logic) and the notification channel
+(same ntfy topic as close alerts, distinguished by a "BUY SIGNAL:" title
+prefix and a `moneybag` tag rather than a separate topic) were both
+confirmed with the user via clarifying questions before implementing,
+since guessing at entry-signal criteria or notification routing would
+have been a real design decision, not a mechanical wiring task.
+
+**New files:**
+- `src/strategy/buy-signal.ts` — pure functions mirroring
+  `exit-strategy.ts`'s `advanceCandleProgress` pattern but inverted: counts
+  consecutive completed closes *above* SMA7 while SMA7 > SMA30, confirms
+  once past the threshold, and fires `newlyConfirmed` exactly once per
+  continuous STRONG-trend episode (a `signalFiredForThisEpisode` flag
+  resets the moment trend drops out of STRONG, so a later genuine
+  crossover can fire again — without this, a coin sitting in a confirmed
+  uptrend would re-notify every single cycle).
+- `src/background/watchlist-buy-signals.ts` — fetches candles + current
+  price per watchlist symbol (same public Kraken endpoints as
+  market-data-table.ts, deliberately not reusing that module's return
+  shape to avoid touching its established, tested contract) and runs the
+  pure buy-signal logic per symbol, best-effort (one symbol's fetch
+  failure doesn't affect the others).
+
+**Changed files:**
+- `src/shared/types.ts` — `Settings.watchlistCoins: string[]`;
+  `RuntimeState.watchlistSignals: Record<string, BuySignalState>`
+  (persisted golden-cross progress per symbol, survives restarts);
+  `BuySignalState` interface; `"BUY_SIGNAL_DETECTED"` added to
+  `AuditEventType`.
+- `src/shared/constants.ts` — `DEFAULT_SETTINGS.watchlistCoins = []`;
+  `MAX_WATCHLIST_COINS = 5`.
+- `src/storage/migrations.ts` — `watchlistSignals: {}` default in both
+  `freshRuntimeState()` and `migrateState()`.
+- `src/background/market-data-table.ts` — `settings.watchlistCoins` folded
+  into the existing symbol set alongside detected positions and
+  `DEV_WATCHLIST_SYMBOLS`, so watchlist coins get real SMA7/30/trend data
+  via the same infra positions already use.
+- `src/background/execution-notify.ts` — added `sendBuySignalWebhook`,
+  `buildBuySignalTitle`, `buildBuySignalBody` alongside the existing
+  execution-notification functions; distinct Title prefix ("BUY SIGNAL:"),
+  `Priority: high` (not `urgent` — informational, not safety-critical),
+  and `Tags: moneybag` so it's never confused with a close alert even
+  sharing the same ntfy topic.
+- `src/background/service-worker.ts` — `refreshMarketData()` now also
+  runs `evaluateWatchlistBuySignals()` whenever `watchlistCoins` is
+  non-empty (both the periodic automatic refresh and the manual "Refresh
+  Positions + Market Data" button), persists the updated
+  `watchlistSignals`, and on `newlyConfirmed` appends a
+  `BUY_SIGNAL_DETECTED` audit entry + Chrome notification + ntfy push.
+- `src/sidepanel/components.ts` — new "Interested Kraken Coins" section in
+  Settings (comma/space-separated symbol input, validated against
+  `MAX_WATCHLIST_COINS` and a symbol-format regex, same pattern as the
+  ntfy URL/email validators); new `renderInterestedCoinsPanel()` — its own
+  distinct panel/section (not folded into the existing Market Data table),
+  showing each watchlist coin's current price, SMA7/30, trend, and
+  golden-cross progress (e.g. "1/2 closes above SMA7").
+- `src/sidepanel/sidepanel.ts` — wires `renderInterestedCoinsPanel` into
+  the Market tab, above the existing Market Data table.
+
+**Testing:** `tests/buy-signal.test.ts` (10 new tests) covers the counter
+advancing/resetting, the STRONG-trend requirement, the once-per-episode
+fire rule and its reset on trend drop-out, no-double-counting across
+repeated calls, and a null-SMA data gap not being misread as a reset.
+`tests/execution-notify.test.ts` gained 6 new tests for the buy-signal
+notification builders/webhook (distinct title/tag/priority, no-op on
+empty/unsupported URL, swallows fetch errors). `tests/market-data-table.test.ts`
+gained 1 new test confirming `Settings.watchlistCoins` symbols appear
+correctly as `WATCHLIST` rows alongside `DETECTED_POSITION` rows.
+
+All four gates pass: `npm run typecheck`, `npm run lint`, `npm test`
+(196/196, up from 180), `npm run build`.
+
+## 21. Addendum: dangling close-dialog bug found during a real armed session (this session)
+
+While actually armed with real positions, a LIVE Auto-Close attempt on
+JTO hit `OPEN_CLOSE_DIALOG`'s validation step, failed
+("Could not validate close dialog."), and correctly did **not** click
+Kraken's final confirm button — but left Kraken's own real "Close
+position" dialog open and unattended on the page. The user discovered it
+by returning to the tab and manually dismissing it themselves. Separately,
+after that, the side panel started reporting `Positions: 0`,
+`Parser: NO_POSITIONS` even though the real Kraken page still clearly
+listed all 5 lots.
+
+**Root cause:** `openKrakenCloseDialog()` and `confirmValidatedCloseModal()`
+(both in `src/content/close-preview.ts`) click through to open/interact
+with Kraken's real dialog, but neither had any code path to close it again
+if validation failed at either step — the dialog was simply abandoned open.
+The `NO_POSITIONS` regression is very likely a *downstream consequence* of
+this, not a separate parser bug: Kraken's own SPA plausibly unmounts/hides
+its position table while its own modal is open, so any scan that ran while
+the dangling dialog sat there would genuinely find nothing in the DOM.
+
+**Fix:** added `dismissOpenModal()` — dispatches a standard Escape keydown
+on `document` (never clicks any button inside the modal, so there's no risk
+of hitting the wrong control) — and call it from both failure branches in
+`openKrakenCloseDialog` (after `waitForCloseModal` resolves not-ready) and
+both failure branches in `confirmValidatedCloseModal` (validation not ready,
+or final-submit button count isn't exactly one). Best-effort: if Kraken's
+dialog doesn't honor Escape, behavior is unchanged from before (dialog stays
+open) — never worse than today.
+
+**User-facing clarification, not a bug:** the user was initially confused
+by two notifications on their phone reading "XPL closed (LIVE)" (SUCCESS)
+and "JTO FAILED (LIVE)" with fabricated example numbers — those were my
+own manual curl test pushes from earlier in the session (used to
+demonstrate the notification format), not real executions. Worth noting
+in case this surfaces again: test notifications and real ones currently
+look identical in the phone's notification history with no way to tell
+them apart after the fact. A future improvement worth considering: prefix
+test notifications distinctly (e.g. "[TEST]") if manual testing like this
+happens again close to real armed usage.
+
+**Testing:** 2 new tests in `tests/close-modal-validation.test.ts`
+confirm `confirmValidatedCloseModal` dispatches the Escape keydown on both
+failure paths (validation not ready; wrong final-button count) instead of
+leaving the dialog untouched. `openKrakenCloseDialog`'s own wiring (same
+`dismissOpenModal()` call) is not separately tested — no existing test
+harness exercises that function today (it requires simulating an
+asynchronous modal appearing after a click), and the shared dismissal
+function itself is already proven correct via the above tests.
+
+All four gates pass: `npm run typecheck`, `npm run lint`, `npm test`
+(198/198, up from 196), `npm run build`.

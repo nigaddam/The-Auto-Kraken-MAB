@@ -54,7 +54,9 @@ export async function buildMarketDataTable(
       .filter((p) => p.status === "ACTIVE")
       .map((p) => p.symbol)
   );
-  const allSymbols = new Set(options.symbols ?? [...detectedSymbols, ...DEV_WATCHLIST_SYMBOLS]);
+  const allSymbols = new Set(
+    options.symbols ?? [...detectedSymbols, ...settings.watchlistCoins, ...DEV_WATCHLIST_SYMBOLS]
+  );
 
   const table: Record<string, MarketDataRow> = options.symbols ? { ...(options.previous ?? {}) } : {};
 

@@ -42,6 +42,29 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
+/** Best-effort dismissal for a Kraken close dialog this extension itself
+ * opened but then decided NOT to confirm (validation failed). Deliberately
+ * never clicks any button inside the modal — that risks hitting the wrong
+ * control — instead dispatches the standard Escape keydown that virtually
+ * all accessible (role="dialog"/aria-modal) implementations respect for
+ * dismissal. If Kraken's dialog doesn't honor it, this is a no-op; it never
+ * makes things worse than leaving the dialog open, which is today's
+ * behavior. Also matters for a second reason: some SPA modal
+ * implementations unmount the underlying positions table while their own
+ * dialog is open, so a dangling dialog can make the next position scan
+ * wrongly read zero positions until the dialog is dismissed. */
+function dismissOpenModal(): void {
+  const escEvent = new KeyboardEvent("keydown", {
+    key: "Escape",
+    code: "Escape",
+    keyCode: 27,
+    which: 27,
+    bubbles: true,
+    cancelable: true,
+  });
+  document.dispatchEvent(escEvent);
+}
+
 function findModalCandidates(root: ParentNode): Element[] {
   return Array.from(
     root.querySelectorAll<Element>(
@@ -198,12 +221,16 @@ export function confirmValidatedCloseModal(root: ParentNode, symbol: string): {
   clicked: boolean;
 } {
   const validation = validateCloseModal(root, symbol);
-  if (!validation.ready) return { validation, clicked: false };
+  if (!validation.ready) {
+    dismissOpenModal();
+    return { validation, clicked: false };
+  }
   const modal = findModalCandidates(root).find((candidate) =>
     new RegExp(`\\b${symbol.toUpperCase()}\\b`, "i").test(compactText(candidate))
   );
   const controls = modal ? findFinalCloseControls(modal, symbol) : [];
   if (controls.length !== 1) {
+    dismissOpenModal();
     return {
       validation: {
         ...validation,
@@ -353,10 +380,17 @@ export function openKrakenCloseDialog(
 
   control.focus();
   control.click();
-  return waitForCloseModal(root, symbol).then((modalValidation) => ({
-    ...resolved.report,
-    ready: modalValidation.ready,
-    blockedReason: modalValidation.blockedReason,
-    modalValidation,
-  }));
+  return waitForCloseModal(root, symbol).then((modalValidation) => {
+    if (!modalValidation.ready) {
+      // Never leave a dialog this extension itself opened sitting on the
+      // page unattended after deciding not to confirm it.
+      dismissOpenModal();
+    }
+    return {
+      ...resolved.report,
+      ready: modalValidation.ready,
+      blockedReason: modalValidation.blockedReason,
+      modalValidation,
+    };
+  });
 }

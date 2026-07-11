@@ -6,6 +6,7 @@ import {
   renderAppHeader,
   renderControlsPanel,
   renderDiagnosticsSection,
+  renderInterestedCoinsPanel,
   renderLogsSection,
   renderMarketDataPanel,
   renderPositionsSection,
@@ -93,7 +94,12 @@ async function render(): Promise<void> {
       ])
     );
   } else if (selectedTab === "market") {
-    app.append(renderTabPanel("market", [renderMarketDataPanel(state, now, controls, marketRefreshState)]));
+    app.append(
+      renderTabPanel("market", [
+        renderInterestedCoinsPanel(state, now),
+        renderMarketDataPanel(state, now, controls, marketRefreshState),
+      ])
+    );
   } else if (selectedTab === "notifications") {
     app.append(renderTabPanel("notifications", [renderLogsSection(logs, controls, state)]));
   } else {

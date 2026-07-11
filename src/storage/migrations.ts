@@ -39,6 +39,7 @@ export function freshRuntimeState(): RuntimeState {
     consecutiveScanFailures: 0,
     monitorStalledSince: null,
     recentlyClosedByExtension: {},
+    watchlistSignals: {},
   };
 }
 
@@ -75,5 +76,6 @@ export function migrateState(raw: unknown): RuntimeState {
     consecutiveScanFailures: state.consecutiveScanFailures ?? 0,
     monitorStalledSince: state.monitorStalledSince ?? null,
     recentlyClosedByExtension: state.recentlyClosedByExtension ?? {},
+    watchlistSignals: state.watchlistSignals ?? {},
   };
 }

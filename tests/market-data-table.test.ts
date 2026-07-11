@@ -164,4 +164,16 @@ describe("buildMarketDataTable", () => {
     expect(table["ZZTEST"]!.apiStatus).toBe("ERROR");
     expect(table["ZZTEST"]!.errorMessage).toMatch(/No unambiguous Kraken USD market/i);
   });
+
+  it("includes the user's Settings.watchlistCoins as WATCHLIST rows, alongside detected positions", async () => {
+    const settings = { ...DEFAULT_SETTINGS, watchlistCoins: ["LINK"] };
+    const positions: Record<string, TrackedPosition> = {
+      jtoA: makeTrackedPosition("JTO", "jtoA"),
+    };
+    const table = await buildMarketDataTable(settings, positions, Date.now());
+    expect(table["JTO"]!.source).toBe("DETECTED_POSITION");
+    expect(table["LINK"]).toBeDefined();
+    expect(table["LINK"]!.source).toBe("WATCHLIST");
+    expect(table["LINK"]!.apiStatus).toBe("OK");
+  });
 });

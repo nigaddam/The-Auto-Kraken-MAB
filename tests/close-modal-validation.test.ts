@@ -114,4 +114,49 @@ describe("validateCloseModal", () => {
     expect(result.validation.ready).toBe(true);
     expect(clicks).toBe(1);
   });
+
+  it("dismisses the dialog (Escape keydown) instead of leaving it open when validation fails", () => {
+    document.body.innerHTML = `
+      <div role="dialog" aria-modal="true">
+        <h2>Close position</h2>
+        <div>Long AAVE</div>
+        <p>Buy 1 AAVE at market</p>
+        <button>Close AAVE long position</button>
+      </div>
+    `;
+    let escapeSeen = false;
+    const listener = (e: Event) => {
+      if (e instanceof KeyboardEvent && e.key === "Escape") escapeSeen = true;
+    };
+    document.addEventListener("keydown", listener);
+    try {
+      const result = confirmValidatedCloseModal(document, "AAVE");
+      expect(result.clicked).toBe(false);
+      expect(escapeSeen).toBe(true);
+    } finally {
+      document.removeEventListener("keydown", listener);
+    }
+  });
+
+  it("dismisses the dialog when the final-submit button count is not exactly one", () => {
+    document.body.innerHTML = `
+      <div role="dialog" aria-modal="true">
+        <h2>Close position</h2>
+        <div>Long AAVE</div>
+        <p>Sell 1 AAVE for ~95.78 USD</p>
+        <button>Cancel</button>
+      </div>
+    `;
+    let escapeSeen = false;
+    const listener = (e: Event) => {
+      if (e instanceof KeyboardEvent && e.key === "Escape") escapeSeen = true;
+    };
+    document.addEventListener("keydown", listener);
+    try {
+      confirmValidatedCloseModal(document, "AAVE");
+      expect(escapeSeen).toBe(true);
+    } finally {
+      document.removeEventListener("keydown", listener);
+    }
+  });
 });

@@ -8,7 +8,7 @@ import type {
   Settings,
   TrackedPosition,
 } from "../shared/types";
-import { DEV_WATCHLIST_SYMBOLS } from "../shared/constants";
+import { DEV_WATCHLIST_SYMBOLS, MAX_WATCHLIST_COINS } from "../shared/constants";
 import {
   isPlausibleEmailAddress,
   isSupportedExecutionWebhookUrl,
@@ -756,6 +756,61 @@ function tradingViewUrl(apiMarket: string): string {
   return `https://www.tradingview.com/chart/?symbol=KRAKEN:${encodeURIComponent(tvSymbol)}`;
 }
 
+export function renderInterestedCoinsPanel(state: RuntimeState, now: number): HTMLElement {
+  const panel = el("section", "panel stack");
+  panel.append(el("h2", undefined, "Interested Kraken Coins"));
+  panel.append(
+    el(
+      "div",
+      "muted",
+      "Read-only watchlist for BUY signals only — never auto-bought. Configure up to " +
+        `${MAX_WATCHLIST_COINS} symbols in Settings.`
+    )
+  );
+
+  const symbols = state.settings.watchlistCoins;
+  if (symbols.length === 0) {
+    panel.append(el("div", "empty-state", "No coins configured yet. Add some in Settings."));
+    return panel;
+  }
+
+  for (const symbol of symbols) {
+    const row_ = state.marketData[symbol];
+    const signal = state.watchlistSignals[symbol];
+    const card = el("article", "market-card");
+    const header = el("div", "market-card-header");
+    const confirmed = signal?.signalFiredForThisEpisode ?? false;
+    header.append(
+      el("strong", undefined, symbol),
+      pill(
+        confirmed ? "BUY SIGNAL" : row_?.trend === "STRONG" ? "Watching" : "No signal",
+        confirmed ? "ok" : row_?.trend === "STRONG" ? "warn" : "neutral"
+      )
+    );
+    card.append(header);
+    if (!row_ || row_.apiStatus !== "OK") {
+      card.append(el("div", "reason-line warn-text", row_?.errorMessage ?? "Market data not available yet."));
+      panel.append(card);
+      continue;
+    }
+    card.append(
+      row("Current price", fmtPrice(row_.currentApiPrice)),
+      row("SMA7", fmtPrice(row_.smaFast)),
+      row("SMA30", fmtPrice(row_.smaSlow)),
+      wrapRow("Trend", pill(row_.trend, trendTone(row_.trend))),
+      row(
+        "Golden-cross progress",
+        signal
+          ? `${signal.consecutiveClosesAboveSmaFast}/${state.settings.strongTrendConfirmationCloses} closes above SMA7`
+          : "Not yet evaluated"
+      ),
+      row("Last checked", fmtAge(row_.lastUpdatedAt, now))
+    );
+    panel.append(card);
+  }
+  return panel;
+}
+
 export function renderMarketDataPanel(
   state: RuntimeState,
   now: number,
@@ -1053,6 +1108,7 @@ export interface SettingsHandlers {
   onSaveSettings: (settings: Settings) => void;
   onResetSettings: () => void;
   onRunDiagnostics: () => void;
+  onRunOrderFormDiagnostics: () => void;
   onExportLogs: () => void;
 }
 
@@ -1108,6 +1164,17 @@ function readNumber(form: HTMLFormElement, key: keyof Settings): number {
 function readCheckbox(form: HTMLFormElement, key: keyof Settings): boolean {
   const input = form.elements.namedItem(key) as HTMLInputElement | null;
   return input?.checked ?? false;
+}
+
+function parseWatchlistCoinsInput(raw: string): string[] {
+  return Array.from(
+    new Set(
+      raw
+        .split(/[,\s]+/)
+        .map((s) => s.trim().toUpperCase())
+        .filter((s) => s.length > 0)
+    )
+  );
 }
 
 function validateSettings(settings: Settings): string[] {
@@ -1254,6 +1321,17 @@ function validateSettings(settings: Settings): string[] {
   if (settings.executionEmailAddress && !isPlausibleEmailAddress(settings.executionEmailAddress)) {
     errors.push("Execution email address doesn't look valid, or leave it blank to disable.");
   }
+  if (settings.watchlistCoins.length > MAX_WATCHLIST_COINS) {
+    errors.push(
+      `Interested Kraken Coins: at most ${MAX_WATCHLIST_COINS} symbols allowed (entered ${settings.watchlistCoins.length}).`
+    );
+  }
+  const invalidWatchlistSymbols = settings.watchlistCoins.filter(
+    (symbol) => !/^[A-Z][A-Z0-9]{1,9}$/.test(symbol)
+  );
+  if (invalidWatchlistSymbols.length > 0) {
+    errors.push(`Interested Kraken Coins: invalid symbol(s): ${invalidWatchlistSymbols.join(", ")}.`);
+  }
   return errors;
 }
 
@@ -1367,6 +1445,21 @@ export function renderSettingsPanel(state: RuntimeState, handlers: SettingsHandl
       "Optional add-on to the ntfy URL above (only works if that's set) — ntfy.sh relays the same alert to " +
         "this address for free, no extra signup. Rate-limited by ntfy.sh's own free tier. Leave blank to skip email."
     ),
+    el("div", "section-title", "Interested Kraken Coins"),
+    textInput(
+      "watchlistCoins",
+      `Coins to watch for BUY signals (max ${MAX_WATCHLIST_COINS})`,
+      state.settings.watchlistCoins.join(", "),
+      "SOL, AVAX, LINK"
+    ),
+    el(
+      "div",
+      "muted",
+      `Comma or space separated, up to ${MAX_WATCHLIST_COINS} symbols. Entirely separate from open positions — ` +
+        "tracked read-only for a golden-cross (SMA7 crosses above SMA30, confirmed) pattern. Sends a clearly " +
+        "distinct \"BUY SIGNAL\" push to the same phone notification URL above — never an order. Kraken can " +
+        "never auto-buy; you place any order yourself. Leave blank to disable."
+    ),
     el("div", "section-title", "Start Monitoring behavior"),
     checkboxInput(
       "startMonitoringWithLiveAutoClose",
@@ -1394,10 +1487,15 @@ export function renderSettingsPanel(state: RuntimeState, handlers: SettingsHandl
   const diagnostics = el("button", undefined, "Diagnostics");
   diagnostics.type = "button";
   diagnostics.addEventListener("click", handlers.onRunDiagnostics);
+  const orderFormDiagnostics = el("button", undefined, "Run Order-Form Diagnostics");
+  orderFormDiagnostics.type = "button";
+  orderFormDiagnostics.title =
+    "Read-only. Open the real Buy tab and account details on Kraken first, then run this — never clicks/fills/submits anything.";
+  orderFormDiagnostics.addEventListener("click", handlers.onRunOrderFormDiagnostics);
   const exportLogs = el("button", undefined, "Export Logs");
   exportLogs.type = "button";
   exportLogs.addEventListener("click", handlers.onExportLogs);
-  actions.append(save, reset, diagnostics, exportLogs);
+  actions.append(save, reset, diagnostics, orderFormDiagnostics, exportLogs);
 
   form.addEventListener("submit", (event) => {
     event.preventDefault();
@@ -1435,6 +1533,7 @@ export function renderSettingsPanel(state: RuntimeState, handlers: SettingsHandl
       startMonitoringWithLiveAutoClose: readCheckbox(form, "startMonitoringWithLiveAutoClose"),
       executionWebhookUrl: readText(form, "executionWebhookUrl"),
       executionEmailAddress: readText(form, "executionEmailAddress"),
+      watchlistCoins: parseWatchlistCoinsInput(readText(form, "watchlistCoins")),
     };
     const errors = validateSettings(next);
     if (errors.length > 0) {

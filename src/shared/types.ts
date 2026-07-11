@@ -543,3 +543,41 @@ export interface DiagnosticsReport {
   groups: PositionGroupDiagnostics[];
   structuralCensus: StructuralCensus;
 }
+
+/** Read-only calibration report for Kraken's Buy/Open order form and the
+ * account-equity display — neither has ever been inspected by this
+ * extension before. Never clicks, fills, or hovers; purely reports what
+ * exists so real selectors can be chosen deliberately (same rule as
+ * DiagnosticsReport). This is the hard prerequisite for any future
+ * order-placement automation — see HANDOFF.md's autonomous-buy addendum. */
+export interface OrderFormControlInfo {
+  found: boolean;
+  ambiguous: boolean;
+  candidateCount: number;
+  ariaLabelPresent: boolean;
+  titlePresent: boolean;
+  dataTestId: string | null;
+  accessibleName: string | null;
+  roleIsButton: boolean;
+}
+
+export interface OrderFormDiagnosticsReport {
+  generatedAt: number;
+  url: string;
+  orderEntryPanelDetected: boolean;
+  buyTabControl: OrderFormControlInfo | null;
+  buyTabSelected: boolean | "UNKNOWN";
+  sellTabControl: OrderFormControlInfo | null;
+  sellTabSelected: boolean | "UNKNOWN";
+  quantityInputDetected: boolean;
+  quantityInputCurrentValue: string | null;
+  quantityInputStep: string | null;
+  leverageValueText: string | null;
+  orderTypeIsMarket: boolean | "UNKNOWN";
+  orderTypeIsLimit: boolean | "UNKNOWN";
+  submitControl: OrderFormControlInfo | null;
+  accountEquityLabelFound: boolean;
+  accountEquityText: string | null;
+  accountEquityParsed: number | null;
+  rawPanelTextExcerpt: string | null;
+}

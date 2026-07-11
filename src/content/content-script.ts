@@ -2,6 +2,7 @@ import type { ScanResultMessage } from "../shared/messages";
 import { isExtensionMessage } from "../shared/messages";
 import { confirmValidatedCloseModal, openKrakenCloseDialog, previewClosePosition, validateCloseModal } from "./close-preview";
 import { runDiagnostics } from "./diagnostics";
+import { runOrderFormDiagnostics } from "./order-form-diagnostics";
 import { checkPageHealth } from "./page-health";
 import { parsePositionsFromDocument } from "./position-parser";
 
@@ -57,6 +58,13 @@ chrome.runtime.onMessage.addListener(
       // marks the tab connected and keeps everything else up to date.
       scanAndReport();
       return undefined; // responded synchronously; no need to keep the channel open
+    }
+
+    if (message.type === "RUN_ORDER_FORM_DIAGNOSTICS") {
+      const report = runOrderFormDiagnostics(document, window.location.href);
+      console.log("[kraken-guard] Order-form diagnostics report (sanitized):", report);
+      sendResponse({ type: "ORDER_FORM_DIAGNOSTICS_RESULT", report, error: null });
+      return undefined;
     }
 
     if (message.type === "PREVIEW_CLOSE") {

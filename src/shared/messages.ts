@@ -3,6 +3,7 @@ import type {
   ExecutionMode,
   CloseModalValidation,
   LiveAutoClosePreflightResult,
+  OrderFormDiagnosticsReport,
   PageHealthStatus,
   ParsedPositionData,
   PreviewCloseReport,
@@ -143,6 +144,22 @@ export interface DomDiagnosticsResultMessage {
   error: string | null;
 }
 
+/** Side panel -> service worker -> content script: read-only calibration
+ * scan of Kraken's Buy/Open order form and account-equity display. Never
+ * clicks, fills, or hovers — see OrderFormDiagnosticsReport's doc comment.
+ * This is the prerequisite step before any real order-placement automation
+ * is written; the user runs this against their real, logged-in Kraken tab
+ * (with the Buy tab open) and shares the report back. */
+export interface RunOrderFormDiagnosticsMessage {
+  type: "RUN_ORDER_FORM_DIAGNOSTICS";
+}
+
+export interface OrderFormDiagnosticsResultMessage {
+  type: "ORDER_FORM_DIAGNOSTICS_RESULT";
+  report: OrderFormDiagnosticsReport | null;
+  error: string | null;
+}
+
 export interface PreviewCloseMessage {
   type: "PREVIEW_CLOSE";
   fingerprint: string;
@@ -219,6 +236,8 @@ export type ExtensionMessage =
   | ResetSettingsMessage
   | RunDomDiagnosticsMessage
   | DomDiagnosticsResultMessage
+  | RunOrderFormDiagnosticsMessage
+  | OrderFormDiagnosticsResultMessage
   | PreviewCloseMessage
   | PreviewCloseResultMessage
   | OpenCloseDialogMessage

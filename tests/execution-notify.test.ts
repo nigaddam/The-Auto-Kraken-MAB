@@ -1,10 +1,14 @@
 import { describe, expect, it } from "vitest";
 import {
+  buildBuySignalBody,
+  buildBuySignalTitle,
   buildExecutionNotificationBody,
   buildExecutionNotificationTitle,
   isPlausibleEmailAddress,
   isSupportedExecutionWebhookUrl,
+  sendBuySignalWebhook,
   sendExecutionWebhook,
+  type BuySignalNotificationDetails,
   type ExecutionNotificationDetails,
 } from "../src/background/execution-notify";
 
@@ -230,6 +234,88 @@ describe("sendExecutionWebhook", () => {
     try {
       await expect(
         sendExecutionWebhook("https://ntfy.sh/my-topic", makeDetails())
+      ).resolves.toBeUndefined();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+function makeBuySignalDetails(
+  overrides: Partial<BuySignalNotificationDetails> = {}
+): BuySignalNotificationDetails {
+  return {
+    symbol: "SOL",
+    currentPrice: 150.25,
+    smaFast: 148.1,
+    smaSlow: 145.0,
+    consecutiveClosesAboveSmaFast: 2,
+    timestamp: 1_700_000_000_000,
+    ...overrides,
+  };
+}
+
+describe("buildBuySignalTitle / buildBuySignalBody", () => {
+  it("clearly labels it as a BUY SIGNAL, distinct from a close notification", () => {
+    expect(buildBuySignalTitle(makeBuySignalDetails())).toBe("BUY SIGNAL: SOL");
+  });
+
+  it("includes the pattern, prices, and an explicit no-order-placed disclaimer", () => {
+    const body = buildBuySignalBody(makeBuySignalDetails());
+    expect(body).toContain("Symbol: SOL");
+    expect(body).toContain("Golden cross");
+    expect(body).toContain("Current price: 150.25");
+    expect(body).toContain("SMA7: 148.1");
+    expect(body).toContain("SMA30: 145");
+    expect(body).toContain("Informational only");
+  });
+});
+
+describe("sendBuySignalWebhook", () => {
+  it("POSTs with a distinct title/tag/priority from execution notifications", async () => {
+    const calls: [string, RequestInit][] = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (url: unknown, init?: unknown) => {
+      calls.push([url as string, init as RequestInit]);
+      return Promise.resolve(new Response());
+    };
+    try {
+      await sendBuySignalWebhook("https://ntfy.sh/my-topic", makeBuySignalDetails());
+      const call = calls[0];
+      if (!call) throw new Error("expected a fetch call");
+      const [url, init] = call;
+      expect(url).toBe("https://ntfy.sh/my-topic");
+      const headers = init.headers as Record<string, string>;
+      expect(headers.Title).toBe("BUY SIGNAL: SOL");
+      expect(headers.Priority).toBe("high");
+      expect(headers.Tags).toBe("moneybag");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("does nothing when the URL is empty or unsupported", async () => {
+    const calls: unknown[] = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (...args: unknown[]) => {
+      calls.push(args);
+      return Promise.resolve(new Response());
+    };
+    try {
+      await sendBuySignalWebhook("", makeBuySignalDetails());
+      await sendBuySignalWebhook("https://example.com/hook", makeBuySignalDetails());
+      expect(calls.length).toBe(0);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("swallows fetch errors instead of throwing", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = () => Promise.reject(new Error("network down"));
+    try {
+      await expect(
+        sendBuySignalWebhook("https://ntfy.sh/my-topic", makeBuySignalDetails())
       ).resolves.toBeUndefined();
     } finally {
       globalThis.fetch = originalFetch;
