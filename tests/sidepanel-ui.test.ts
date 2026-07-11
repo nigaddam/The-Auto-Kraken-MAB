@@ -223,6 +223,7 @@ describe("side panel tab content", () => {
         reset = true;
       },
       onRunDiagnostics: NOOP,
+      onRunOrderFormDiagnostics: NOOP,
       onExportLogs: NOOP,
     });
 
@@ -252,6 +253,7 @@ describe("side panel tab content", () => {
       },
       onResetSettings: NOOP,
       onRunDiagnostics: NOOP,
+      onRunOrderFormDiagnostics: NOOP,
       onExportLogs: NOOP,
     });
 

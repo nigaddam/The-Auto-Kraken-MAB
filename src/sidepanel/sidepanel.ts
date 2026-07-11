@@ -1,6 +1,12 @@
 import { isExtensionMessage } from "../shared/messages";
 import type { GetStateMessage } from "../shared/messages";
-import type { DiagnosticsReport, RuntimeState, Settings, TrackedPosition } from "../shared/types";
+import type {
+  DiagnosticsReport,
+  OrderFormDiagnosticsReport,
+  RuntimeState,
+  Settings,
+  TrackedPosition,
+} from "../shared/types";
 import { getAuditLog } from "../storage/audit-log";
 import {
   renderAppHeader,
@@ -9,6 +15,7 @@ import {
   renderInterestedCoinsPanel,
   renderLogsSection,
   renderMarketDataPanel,
+  renderOrderFormDiagnosticsSection,
   renderPositionsSection,
   renderSettingsPanel,
   renderStatusPanel,
@@ -30,6 +37,8 @@ if (!app) {
 let latestState: RuntimeState | null = null;
 let latestDiagnosticsReport: DiagnosticsReport | null = null;
 let latestDiagnosticsError: string | null = null;
+let latestOrderFormDiagnosticsReport: OrderFormDiagnosticsReport | null = null;
+let latestOrderFormDiagnosticsError: string | null = null;
 let selectedTab: TabId = "positions";
 let marketRefreshState: MarketRefreshUiState = { refreshing: null, message: null, error: null };
 let previewCloseState: PreviewCloseUiState = { message: null, error: null };
@@ -108,6 +117,7 @@ async function render(): Promise<void> {
         onSaveSettings: (settings) => void saveSettings(settings),
         onResetSettings: () => void resetSettings(),
         onRunDiagnostics: () => void runDiagnosticsAndRender(),
+        onRunOrderFormDiagnostics: () => void runOrderFormDiagnosticsAndRender(),
         onExportLogs: () => void exportLogs(),
       }),
     ];
@@ -116,6 +126,11 @@ async function render(): Promise<void> {
         renderDiagnosticsSection(latestDiagnosticsReport, latestDiagnosticsError, () =>
           void copyDiagnosticsToClipboard()
         )
+      );
+    }
+    if (latestOrderFormDiagnosticsReport || latestOrderFormDiagnosticsError) {
+      children.push(
+        renderOrderFormDiagnosticsSection(latestOrderFormDiagnosticsReport, latestOrderFormDiagnosticsError)
       );
     }
     app.append(renderTabPanel("settings", children));
@@ -288,6 +303,18 @@ async function runDiagnosticsAndRender(): Promise<void> {
   } else {
     latestDiagnosticsReport = null;
     latestDiagnosticsError = "Unexpected response while running diagnostics.";
+  }
+  await render();
+}
+
+async function runOrderFormDiagnosticsAndRender(): Promise<void> {
+  const response: unknown = await chrome.runtime.sendMessage({ type: "RUN_ORDER_FORM_DIAGNOSTICS" });
+  if (isExtensionMessage(response) && response.type === "ORDER_FORM_DIAGNOSTICS_RESULT") {
+    latestOrderFormDiagnosticsReport = response.report;
+    latestOrderFormDiagnosticsError = response.error;
+  } else {
+    latestOrderFormDiagnosticsReport = null;
+    latestOrderFormDiagnosticsError = "Unexpected response while running order-form diagnostics.";
   }
   await render();
 }

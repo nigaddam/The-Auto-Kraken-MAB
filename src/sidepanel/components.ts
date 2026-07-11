@@ -3,6 +3,7 @@ import type {
   Decision,
   DiagnosticsReport,
   MarketDataRow,
+  OrderFormDiagnosticsReport,
   RuntimeState,
   SessionState,
   Settings,
@@ -1100,6 +1101,59 @@ export function renderDiagnosticsSection(
       );
       panel.append(line);
     }
+  }
+  return panel;
+}
+
+function controlSummary(label: string, info: OrderFormDiagnosticsReport["buyTabControl"]): HTMLElement {
+  if (!info) return row(label, "Not found");
+  const detail = info.ambiguous
+    ? `${info.candidateCount} candidates (ambiguous)`
+    : (info.accessibleName ?? "found, no accessible name");
+  return row(label, detail);
+}
+
+/** Read-only report of Kraken's Buy/Open order form + account-equity
+ * display — this is calibration data, not a working feature. See
+ * order-form-diagnostics.ts's doc comment: nothing here has been clicked,
+ * filled, or submitted. */
+export function renderOrderFormDiagnosticsSection(
+  report: OrderFormDiagnosticsReport | null,
+  error: string | null
+): HTMLElement {
+  const panel = el("section", "panel stack diagnostics-panel");
+  panel.append(el("h2", undefined, "Order-Form Diagnostics (read-only, not yet a working feature)"));
+
+  if (error) {
+    panel.append(el("div", "banner danger", error));
+    return panel;
+  }
+  if (!report) {
+    panel.append(el("div", "empty-state", "Order-form diagnostics have not been run."));
+    return panel;
+  }
+
+  panel.append(
+    row("Order entry panel", report.orderEntryPanelDetected ? "Detected" : "Not detected"),
+    controlSummary("Buy tab", report.buyTabControl),
+    row("Buy tab selected", String(report.buyTabSelected)),
+    controlSummary("Sell tab", report.sellTabControl),
+    row("Sell tab selected", String(report.sellTabSelected)),
+    row("Quantity input", report.quantityInputDetected ? "Detected" : "Not detected"),
+    row("Quantity current value", report.quantityInputCurrentValue ?? "-"),
+    row("Quantity step", report.quantityInputStep ?? "-"),
+    row("Leverage (read-only)", report.leverageValueText ?? "Not found"),
+    row("Order type is Market", String(report.orderTypeIsMarket)),
+    row("Order type is Limit", String(report.orderTypeIsLimit)),
+    controlSummary("Submit control", report.submitControl),
+    row("Account equity label found", report.accountEquityLabelFound ? "Yes" : "No"),
+    row("Account equity text", report.accountEquityText ?? "-"),
+    row("Account equity parsed", report.accountEquityParsed !== null ? String(report.accountEquityParsed) : "-")
+  );
+
+  if (report.rawPanelTextExcerpt) {
+    panel.append(el("div", "section-title", "Raw panel text (sanitized excerpt)"));
+    panel.append(el("div", "reason", report.rawPanelTextExcerpt));
   }
   return panel;
 }
