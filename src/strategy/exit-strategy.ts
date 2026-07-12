@@ -10,7 +10,7 @@ import type {
   TrackedPosition,
   TrendStrength,
 } from "../shared/types";
-import { computeATR, computeTripleSmaSeries, normalizedSlope } from "./sma";
+import { computeIndicatorSnapshot, requiredCandleCount } from "./indicators";
 
 export function computeCurrentReturnPct(openingPrice: number, currentPrice: number): number {
   return ((currentPrice - openingPrice) / openingPrice) * 100;
@@ -259,42 +259,13 @@ export function computeDynamicProfitFloorPct(
   return previousFloorPct === null ? next : Math.max(previousFloorPct, next);
 }
 
-export function classifyRegime(input: {
-  sma7: number;
-  sma30: number;
-  slope7: number;
-  slope30: number;
-  latestClose: number;
-  closesBelowSma7: number;
-  settings: Settings;
-}): StrategyRegime {
-  if (input.sma7 <= input.sma30 && input.slope30 <= 0) return "BROKEN";
-  const expansion =
-    input.sma7 > input.sma30 &&
-    input.slope7 >= input.settings.slope7Positive &&
-    input.slope30 > 0 &&
-    input.latestClose >= input.sma7;
-  if (expansion) return "EXPANSION";
-  const deteriorating =
-    (input.sma7 > input.sma30 && input.slope7 < input.settings.slope7Negative) ||
-    (input.sma7 > input.sma30 && input.closesBelowSma7 > 0) ||
-    (input.slope30 < input.settings.slope30FlatLowerBound);
-  if (deteriorating) return "DETERIORATING";
-  return "HEALTHY";
-}
+/** Re-exported for backward compatibility — moved to indicators.ts as part
+ * of the shared-indicator extraction (both the exit engine and the new
+ * entry/Recovery Cross engine consume it from there now). */
+export { classifyRegime } from "./indicators";
 
 function returnPct(entryPrice: number, price: number): number {
   return ((price - entryPrice) / entryPrice) * 100;
-}
-
-function countLatestClosesBelowSma7(series: { close: number; sma7: number | null; ts: number }[]): number {
-  let count = 0;
-  for (let i = series.length - 1; i >= 0; i--) {
-    const point = series[i]!;
-    if (point.sma7 === null || point.close >= point.sma7) break;
-    count += 1;
-  }
-  return count;
 }
 
 function buildDiagnostics(
@@ -336,17 +307,20 @@ function buildDiagnostics(
 
 export function evaluateVolatilityAdjustedStrategy(input: VolatilityStrategyInput): VolatilityStrategyResult {
   const { position, candles, apiPrice, settings, now } = input;
-  const requiredCandles = Math.max(
-    settings.longSma + settings.slope90LookbackHours,
-    settings.slowSma + settings.slope30LookbackHours,
-    settings.fastSma + settings.slope7LookbackHours,
-    settings.atrPeriod + 1
-  );
   const previousPeakPrice = position.peakPrice || position.highestObservedPrice || position.openingPrice;
   const currentReturnPct = Number.isFinite(apiPrice) && apiPrice > 0 ? returnPct(position.openingPrice, apiPrice) : null;
 
-  if (candles.length < requiredCandles) {
-    const reason = `Strategy data invalid: insufficient completed 1h candles for SMA90/ATR/slope history (got ${candles.length}, need ${requiredCandles}).`;
+  const snapshot = computeIndicatorSnapshot(candles, settings);
+
+  if (!snapshot.dataValid) {
+    // Two distinct invalid causes, kept distinct exactly as before
+    // extraction: insufficient candle history preserves the position's
+    // last known SMA7 counter and lastProcessedCandleTs (nothing new was
+    // observed), whereas sufficient history with an unusable SMA/ATR/slope
+    // shape resets the counter to 0 and advances lastProcessedCandleTs to
+    // the latest candle (a real candle was observed, just not usable yet).
+    const insufficientHistory = candles.length < requiredCandleCount(settings);
+    const reason = snapshot.invalidReason!;
     const diagnostics = buildDiagnostics(input, {
       decision: "ERROR",
       reasonCode: "STRATEGY_DATA_INVALID",
@@ -357,19 +331,21 @@ export function evaluateVolatilityAdjustedStrategy(input: VolatilityStrategyInpu
       profitProtectionActive: position.profitFloorPct !== null,
       profitFloorPct: position.profitFloorPct,
       effectiveHardLossPct: settings.hardLossFallbackPct,
-      sma7: null,
-      sma30: null,
-      sma90: null,
-      atr14: null,
-      atrPct: null,
-      slope7: null,
-      slope30: null,
-      slope90: null,
+      sma7: snapshot.sma7,
+      sma30: snapshot.sma30,
+      sma90: snapshot.sma90,
+      atr14: snapshot.atr14,
+      atrPct: snapshot.atrPct,
+      slope7: snapshot.slope7,
+      slope30: snapshot.slope30,
+      slope90: snapshot.slope90,
       regime: "UNKNOWN",
-      completedClosesBelowSma7: position.consecutiveClosesBelowSmaFast,
+      completedClosesBelowSma7: insufficientHistory ? position.consecutiveClosesBelowSmaFast : 0,
       majorTrendBreakLevel: null,
-      candleTimestamp: candles[candles.length - 1]?.ts ?? null,
-      nextCloseCondition: "Need sufficient valid completed hourly history before execution.",
+      candleTimestamp: snapshot.candleTimestamp,
+      nextCloseCondition: insufficientHistory
+        ? "Need sufficient valid completed hourly history before execution."
+        : "Need valid SMA90/ATR/slope inputs before execution.",
     });
     return {
       decision: "ERROR",
@@ -378,77 +354,26 @@ export function evaluateVolatilityAdjustedStrategy(input: VolatilityStrategyInpu
       peakReturnPct: position.peakReturnPct,
       peakPrice: previousPeakPrice,
       profitFloorPct: position.profitFloorPct,
-      consecutiveClosesBelowSma7: position.consecutiveClosesBelowSmaFast,
-      lastProcessedCandleTs: position.lastProcessedCandleTs,
+      consecutiveClosesBelowSma7: insufficientHistory ? position.consecutiveClosesBelowSmaFast : 0,
+      lastProcessedCandleTs: insufficientHistory ? position.lastProcessedCandleTs : snapshot.candleTimestamp,
       hardLossObservedSince: null,
       hardLossObservationCount: 0,
       diagnostics,
     };
   }
 
-  const maSeries = computeTripleSmaSeries(candles, settings.fastSma, settings.slowSma, settings.longSma);
-  const atrSeries = computeATR(candles, settings.atrPeriod);
-  const latestIndex = candles.length - 1;
-  const latest = candles[latestIndex]!;
-  const latestMa = maSeries[latestIndex]!;
-  const atr14 = atrSeries[latestIndex] ?? null;
-  const atrPct = atr14 !== null ? atr14 / latest.close : null;
-  const sma7Values = maSeries.map((p) => p.sma7);
-  const sma30Values = maSeries.map((p) => p.sma30);
-  const sma90Values = maSeries.map((p) => p.sma90);
-  const slope7 = normalizedSlope(sma7Values, latestIndex, settings.slope7LookbackHours, atr14);
-  const slope30 = normalizedSlope(sma30Values, latestIndex, settings.slope30LookbackHours, atr14);
-  const slope90 = normalizedSlope(sma90Values, latestIndex, settings.slope90LookbackHours, atr14);
-  const dataInvalid =
-    latestMa.sma7 === null ||
-    latestMa.sma30 === null ||
-    latestMa.sma90 === null ||
-    atr14 === null ||
-    atr14 <= 0 ||
-    slope7 === null ||
-    slope30 === null ||
-    slope90 === null;
-
-  if (dataInvalid) {
-    const reason = "Strategy data invalid: SMA90, ATR14, or normalized slope is unavailable.";
-    const diagnostics = buildDiagnostics(input, {
-      decision: "ERROR",
-      reasonCode: "STRATEGY_DATA_INVALID",
-      reason,
-      currentReturnPct,
-      peakReturnPct: position.peakReturnPct,
-      peakPrice: previousPeakPrice,
-      profitProtectionActive: position.profitFloorPct !== null,
-      profitFloorPct: position.profitFloorPct,
-      effectiveHardLossPct: settings.hardLossFallbackPct,
-      sma7: latestMa.sma7,
-      sma30: latestMa.sma30,
-      sma90: latestMa.sma90,
-      atr14,
-      atrPct,
-      slope7,
-      slope30,
-      slope90,
-      regime: "UNKNOWN",
-      completedClosesBelowSma7: 0,
-      majorTrendBreakLevel: null,
-      candleTimestamp: latest.ts,
-      nextCloseCondition: "Need valid SMA90/ATR/slope inputs before execution.",
-    });
-    return {
-      decision: "ERROR",
-      reasonCode: "STRATEGY_DATA_INVALID",
-      reason,
-      peakReturnPct: position.peakReturnPct,
-      peakPrice: previousPeakPrice,
-      profitFloorPct: position.profitFloorPct,
-      consecutiveClosesBelowSma7: 0,
-      lastProcessedCandleTs: latest.ts,
-      hardLossObservedSince: null,
-      hardLossObservationCount: 0,
-      diagnostics,
-    };
-  }
+  const sma7 = snapshot.sma7!;
+  const sma30 = snapshot.sma30!;
+  const sma90 = snapshot.sma90!;
+  const atr14 = snapshot.atr14!;
+  const atrPct = snapshot.atrPct;
+  const slope7 = snapshot.slope7!;
+  const slope30 = snapshot.slope30!;
+  const slope90 = snapshot.slope90!;
+  const latestClose = snapshot.latestClose!;
+  const latestTs = snapshot.candleTimestamp!;
+  const completedClosesBelowSma7 = snapshot.completedClosesBelowSma7;
+  const regime = snapshot.regime;
 
   // The current parser does not expose a reliable entry timestamp, so using
   // all fetched historical candle highs would leak pre-entry highs into a
@@ -463,18 +388,8 @@ export function evaluateVolatilityAdjustedStrategy(input: VolatilityStrategyInpu
     ? computeDynamicProfitFloorPct(peakReturnPct, position.profitFloorPct)
     : position.profitFloorPct;
   const profitFloorPct = computedFloor;
-  const completedClosesBelowSma7 = countLatestClosesBelowSma7(maSeries);
-  const regime = classifyRegime({
-    sma7: latestMa.sma7!,
-    sma30: latestMa.sma30!,
-    slope7,
-    slope30,
-    latestClose: latest.close,
-    closesBelowSma7: completedClosesBelowSma7,
-    settings,
-  });
   const effectiveHardLossPct = computeEffectiveHardLossPct(position.openingPrice, atr14, settings);
-  const majorTrendBreakLevel = latestMa.sma30! - settings.majorTrendBreakAtrBuffer * atr14;
+  const majorTrendBreakLevel = sma30 - settings.majorTrendBreakAtrBuffer * atr14;
 
   let hardLossObservedSince = position.hardLossObservedSince ?? null;
   let hardLossObservationCount = position.hardLossObservationCount ?? 0;
@@ -504,10 +419,10 @@ export function evaluateVolatilityAdjustedStrategy(input: VolatilityStrategyInpu
     reasonCode = "WATCHING_CONFIRMATION";
     reason = `Hard-loss threshold touched (${currentReturnPct.toFixed(2)}% <= ${effectiveHardLossPct.toFixed(2)}%); waiting for debounce confirmation.`;
     nextCloseCondition = "Another valid hard-loss observation after debounce duration.";
-  } else if (latest.close < majorTrendBreakLevel) {
+  } else if (latestClose < majorTrendBreakLevel) {
     decision = "CLOSE";
     reasonCode = "MAJOR_TREND_BREAK";
-    reason = `MAJOR_TREND_BREAK: completed close ${latest.close.toFixed(6)} below SMA30 minus ${settings.majorTrendBreakAtrBuffer.toFixed(2)} ATR (${majorTrendBreakLevel.toFixed(6)}).`;
+    reason = `MAJOR_TREND_BREAK: completed close ${latestClose.toFixed(6)} below SMA30 minus ${settings.majorTrendBreakAtrBuffer.toFixed(2)} ATR (${majorTrendBreakLevel.toFixed(6)}).`;
   } else if (profitProtectionActive && profitFloorPct !== null && currentReturnPct !== null && currentReturnPct <= profitFloorPct) {
     const floorBufferReturnPct = (settings.expansionFloorAtrBuffer * atr14 / position.openingPrice) * 100;
     const floorBreachedWithBuffer = currentReturnPct <= profitFloorPct - floorBufferReturnPct;
@@ -540,7 +455,7 @@ export function evaluateVolatilityAdjustedStrategy(input: VolatilityStrategyInpu
       reason = "PROFIT_LOCK_AND_WEAK_TREND: profit floor breached while regime is weak.";
     }
   } else if (regime === "EXPANSION") {
-    const fastBreak = latest.close < latestMa.sma7! - settings.expansionFastBreakAtrBuffer * atr14 && slope7 < settings.slope7Negative;
+    const fastBreak = latestClose < sma7 - settings.expansionFastBreakAtrBuffer * atr14 && slope7 < settings.slope7Negative;
     if (fastBreak) {
       decision = "CLOSE";
       reasonCode = "EXPANSION_FAST_BREAK";
@@ -578,11 +493,11 @@ export function evaluateVolatilityAdjustedStrategy(input: VolatilityStrategyInpu
     }
   } else if (regime === "DETERIORATING") {
     const previous = candles[candles.length - 2]!;
-    const belowSma7 = latest.close < latestMa.sma7!;
+    const belowSma7 = latestClose < sma7;
     const downsideConfirmed =
-      latest.close < previous.low ||
+      latestClose < previous.low ||
       completedClosesBelowSma7 >= 2 ||
-      latest.close < latestMa.sma7! - settings.deteriorationAtrBreakBuffer * atr14;
+      latestClose < sma7 - settings.deteriorationAtrBreakBuffer * atr14;
     if (belowSma7 && downsideConfirmed) {
       decision = "CLOSE";
       reasonCode = "DETERIORATING_TREND";
@@ -598,7 +513,7 @@ export function evaluateVolatilityAdjustedStrategy(input: VolatilityStrategyInpu
       reason = "Deteriorating regime, but price has not closed below SMA7.";
     }
   } else {
-    if (latest.close < latestMa.sma7!) {
+    if (latestClose < sma7) {
       decision = "CLOSE";
       reasonCode = "BROKEN_TREND";
       reason = "BROKEN_TREND: BROKEN regime and completed close below SMA7.";
@@ -627,9 +542,9 @@ export function evaluateVolatilityAdjustedStrategy(input: VolatilityStrategyInpu
     profitProtectionActive,
     profitFloorPct,
     effectiveHardLossPct,
-    sma7: latestMa.sma7,
-    sma30: latestMa.sma30,
-    sma90: latestMa.sma90,
+    sma7,
+    sma30,
+    sma90,
     atr14,
     atrPct,
     slope7,
@@ -638,7 +553,7 @@ export function evaluateVolatilityAdjustedStrategy(input: VolatilityStrategyInpu
     regime,
     completedClosesBelowSma7,
     majorTrendBreakLevel,
-    candleTimestamp: latest.ts,
+    candleTimestamp: latestTs,
     nextCloseCondition,
   });
 
@@ -650,7 +565,7 @@ export function evaluateVolatilityAdjustedStrategy(input: VolatilityStrategyInpu
     peakPrice,
     profitFloorPct,
     consecutiveClosesBelowSma7: completedClosesBelowSma7,
-    lastProcessedCandleTs: latest.ts,
+    lastProcessedCandleTs: latestTs,
     hardLossObservedSince,
     hardLossObservationCount,
     diagnostics,
