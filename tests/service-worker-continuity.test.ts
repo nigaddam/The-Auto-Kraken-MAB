@@ -374,6 +374,31 @@ describe("monitoring loop continuity", () => {
     expect(response.liveArmed).toBe(false);
     expect(response.preflightBlockers.length).toBeGreaterThan(0);
   });
+
+  it("relays OPEN_BUY_ORDER and CONFIRM_BUY_ORDER from the panel to the tab instead of hanging", async () => {
+    // Regression test: the panel sends these via chrome.runtime.sendMessage,
+    // which reaches the service worker, not the tab directly — without an
+    // explicit case relaying it via sendMessageToKrakenTab, sendResponse is
+    // never called and the panel's promise hangs forever (exactly what
+    // happened before this test was added: the content-script side and
+    // Autopilot's internal direct-tab-messaging path were both wired
+    // correctly, but the panel-to-tab relay case was missed entirely).
+    await harness.sendMessage({ type: "START_MONITORING" });
+
+    const openResponse = await harness.sendMessage({
+      type: "OPEN_BUY_ORDER",
+      symbol: "ETH",
+      quantityUnits: 0.1,
+    });
+    expect(openResponse).toMatchObject({ type: "OPEN_BUY_ORDER_RESULT" });
+
+    const confirmResponse = await harness.sendMessage({
+      type: "CONFIRM_BUY_ORDER",
+      symbol: "ETH",
+      quantityUnits: 0.1,
+    });
+    expect(confirmResponse).toMatchObject({ type: "CONFIRM_BUY_ORDER_RESULT" });
+  });
 });
 
 /**

@@ -9,6 +9,7 @@ import {
   renderSettingsPanel,
   renderStatusPanel,
   renderTabBar,
+  type ManualBuyUiState,
 } from "../src/sidepanel/components";
 import { freshRuntimeState } from "../src/storage/migrations";
 import type { AuditLogEntry, MarketDataRow, RuntimeState, TrackedPosition } from "../src/shared/types";
@@ -240,6 +241,7 @@ describe("side panel tab content", () => {
       settings: { ...freshRuntimeState().settings, watchlistCoins: ["SOL"] },
     };
     const panel = renderInterestedCoinsPanel(state, Date.now(), {
+      ...HANDLERS,
       onUpdateWatchlist: (symbols) => {
         latest = symbols;
       },
@@ -268,12 +270,94 @@ describe("side panel tab content", () => {
       },
       settings: { ...freshRuntimeState().settings, watchlistCoins: ["CCC", "DDD", "EEE"] },
     };
-    const panel = renderInterestedCoinsPanel(state, Date.now(), { onUpdateWatchlist: () => {} });
+    const panel = renderInterestedCoinsPanel(state, Date.now(), { ...HANDLERS, onUpdateWatchlist: () => {} });
     const input = panel.querySelector<HTMLInputElement>(".watchlist-add-row input");
     const addBtn = panel.querySelector<HTMLButtonElement>(".watchlist-add-row button");
     expect(input?.disabled).toBe(true);
     expect(addBtn?.disabled).toBe(true);
     expect(panel.textContent ?? "").toMatch(/Tracking 5 of 5 slots/i);
+  });
+
+  it("shows a Test Buy button on a manual watchlist card with valid price data and wires it up", () => {
+    let requested: [string, number, number | null] | null = null;
+    const state: RuntimeState = {
+      ...freshRuntimeState(),
+      settings: { ...freshRuntimeState().settings, watchlistCoins: ["SOL"] },
+      marketData: { SOL: { ...makeMarketDataRow("SOL"), suggestedBuyUnits: 2.5 } },
+    };
+    const panel = renderInterestedCoinsPanel(state, Date.now(), {
+      ...HANDLERS,
+      onRequestManualBuy: (symbol, quantityUnits, currentPrice) => {
+        requested = [symbol, quantityUnits, currentPrice];
+      },
+    });
+    const buttons = Array.from(panel.querySelectorAll("button"));
+    const testBuyBtn = buttons.find((b) => b.textContent === "Test Buy");
+    expect(testBuyBtn).toBeDefined();
+    testBuyBtn!.click();
+    expect(requested).toEqual(["SOL", 2.5, 1.23]);
+  });
+
+  it("does not show a Test Buy button when market data is unavailable", () => {
+    const state: RuntimeState = {
+      ...freshRuntimeState(),
+      settings: { ...freshRuntimeState().settings, watchlistCoins: ["SOL"] },
+    };
+    const panel = renderInterestedCoinsPanel(state, Date.now(), HANDLERS);
+    const buttons = Array.from(panel.querySelectorAll("button"));
+    expect(buttons.some((b) => b.textContent === "Test Buy")).toBe(false);
+  });
+
+  it("renders the manual buy panel's INITIAL_CONFIRM phase with an editable quantity", () => {
+    let updated: number | null = null;
+    const manualBuyState: ManualBuyUiState = {
+      pending: { symbol: "SOL", quantityUnits: 2.5, currentPrice: 100, phase: "INITIAL_CONFIRM", modalSummary: null },
+    };
+    const state: RuntimeState = { ...freshRuntimeState() };
+    const panel = renderInterestedCoinsPanel(state, Date.now(), {
+      ...HANDLERS,
+      onUpdateManualBuyQuantity: (quantityUnits) => {
+        updated = quantityUnits;
+      },
+    }, manualBuyState);
+
+    expect(panel.textContent).toMatch(/Test Buy SOL\?/);
+    const qtyInput = panel.querySelector<HTMLInputElement>('input[type="number"]');
+    expect(qtyInput).not.toBeNull();
+    expect(qtyInput!.value).toBe("2.5");
+    qtyInput!.value = "1.25";
+    qtyInput!.dispatchEvent(new Event("input"));
+    expect(updated).toBe(1.25);
+
+    const buttons = Array.from(panel.querySelectorAll("button"));
+    expect(buttons.some((b) => b.textContent === "Open Kraken Buy Order")).toBe(true);
+  });
+
+  it("renders the manual buy panel's MODAL_VALIDATED phase with a Confirm Buy button", () => {
+    let confirmed = false;
+    const manualBuyState: ManualBuyUiState = {
+      pending: {
+        symbol: "SOL",
+        quantityUnits: 2.5,
+        currentPrice: 100,
+        phase: "MODAL_VALIDATED",
+        modalSummary: "Quantity 2.5 SOL. Confirm button found.",
+      },
+    };
+    const state: RuntimeState = { ...freshRuntimeState() };
+    const panel = renderInterestedCoinsPanel(state, Date.now(), {
+      ...HANDLERS,
+      onConfirmManualBuy: () => {
+        confirmed = true;
+      },
+    }, manualBuyState);
+
+    expect(panel.textContent).toMatch(/Kraken Buy Confirmation Validated/);
+    expect(panel.textContent).toMatch(/Confirm button found/);
+    const confirmBtn = Array.from(panel.querySelectorAll("button")).find((b) => b.textContent === "Confirm Buy");
+    expect(confirmBtn).toBeDefined();
+    confirmBtn!.click();
+    expect(confirmed).toBe(true);
   });
 
   it("Notifications tab humanizes audit entries", () => {

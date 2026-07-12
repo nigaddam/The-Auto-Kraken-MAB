@@ -15,6 +15,8 @@ import type {
   ExportLogsResultMessage,
   ExtensionMessage,
   ConfirmCloseDialogResultMessage,
+  ConfirmBuyOrderResultMessage,
+  OpenBuyOrderResultMessage,
   OpenCloseDialogResultMessage,
   OrderFormDiagnosticsResultMessage,
   PreviewCloseResultMessage,
@@ -2378,6 +2380,12 @@ async function handleMessage(
     case "CONFIRM_CLOSE_DIALOG":
       await handleConfirmCloseDialog(message, sendResponse);
       break;
+    case "OPEN_BUY_ORDER":
+      await handleOpenBuyOrder(message, sendResponse);
+      break;
+    case "CONFIRM_BUY_ORDER":
+      await handleConfirmBuyOrder(message, sendResponse);
+      break;
     default:
       break;
   }
@@ -2594,6 +2602,100 @@ async function handleOpenCloseDialog(
       report: null,
       error: `Could not reach the content script on the Kraken tab: ${String(err)}`,
     } satisfies OpenCloseDialogResultMessage);
+  }
+}
+
+/** Relays the side panel's manual "Test Buy" OPEN_BUY_ORDER to the Kraken
+ * tab's content script — the same buy-preview.ts logic Autopilot's
+ * processAutopilotBuys() uses internally, just triggered by one supervised
+ * click instead of automatically. Without this relay, chrome.runtime.sendMessage
+ * from the panel would hang forever: it reaches the service worker (not
+ * the tab directly), and with no case here to forward it, sendResponse is
+ * never called. */
+async function handleOpenBuyOrder(
+  message: Extract<ExtensionMessage, { type: "OPEN_BUY_ORDER" }>,
+  sendResponse: (response?: unknown) => void
+): Promise<void> {
+  const tab = await findKrakenTab();
+  if (!tab || tab.id === undefined) {
+    sendResponse({
+      type: "OPEN_BUY_ORDER_RESULT",
+      report: null,
+      error: "No Kraken Prop tab found. Open the Trade page for this symbol and try again.",
+    } satisfies OpenBuyOrderResultMessage);
+    return;
+  }
+
+  try {
+    const raw: unknown = await sendMessageToKrakenTab(tab.id, message);
+    if (isExtensionMessage(raw) && raw.type === "OPEN_BUY_ORDER_RESULT") {
+      sendResponse(raw);
+      return;
+    }
+    sendResponse({
+      type: "OPEN_BUY_ORDER_RESULT",
+      report: null,
+      error: "Unexpected response from the content script.",
+    } satisfies OpenBuyOrderResultMessage);
+  } catch (err) {
+    sendResponse({
+      type: "OPEN_BUY_ORDER_RESULT",
+      report: null,
+      error: `Could not reach the content script on the Kraken tab: ${String(err)}`,
+    } satisfies OpenBuyOrderResultMessage);
+  }
+}
+
+async function handleConfirmBuyOrder(
+  message: Extract<ExtensionMessage, { type: "CONFIRM_BUY_ORDER" }>,
+  sendResponse: (response?: unknown) => void
+): Promise<void> {
+  const tab = await findKrakenTab();
+  if (!tab || tab.id === undefined) {
+    sendResponse({
+      type: "CONFIRM_BUY_ORDER_RESULT",
+      modalValidation: null,
+      clicked: false,
+      error: "No Kraken Prop tab found. Open the Trade page for this symbol and try again.",
+    } satisfies ConfirmBuyOrderResultMessage);
+    return;
+  }
+
+  try {
+    const raw: unknown = await sendMessageToKrakenTab(tab.id, message);
+    if (!isExtensionMessage(raw) || raw.type !== "CONFIRM_BUY_ORDER_RESULT") {
+      sendResponse({
+        type: "CONFIRM_BUY_ORDER_RESULT",
+        modalValidation: null,
+        clicked: false,
+        error: "Unexpected response from the content script.",
+      } satisfies ConfirmBuyOrderResultMessage);
+      return;
+    }
+
+    const state = await getState();
+    await appendAuditEntry(
+      makeAuditEntry(
+        state,
+        raw.clicked && raw.modalValidation?.ready ? "AUTO_BUY_SUCCEEDED" : "AUTO_BUY_BLOCKED",
+        raw.clicked && raw.modalValidation?.ready
+          ? `${message.symbol} manual test buy confirmed (~${message.quantityUnits} units).`
+          : `${message.symbol} manual test buy blocked: ${raw.modalValidation?.blockedReason ?? raw.error ?? "unknown"}`,
+        {
+          symbol: message.symbol,
+          executionResult: raw.clicked && raw.modalValidation?.ready ? "SUCCESS" : "BLOCKED",
+          errorDetails: raw.modalValidation?.blockedReason ?? raw.error ?? null,
+        }
+      )
+    );
+    sendResponse(raw);
+  } catch (err) {
+    sendResponse({
+      type: "CONFIRM_BUY_ORDER_RESULT",
+      modalValidation: null,
+      clicked: false,
+      error: `Could not reach the content script on the Kraken tab: ${String(err)}`,
+    } satisfies ConfirmBuyOrderResultMessage);
   }
 }
 

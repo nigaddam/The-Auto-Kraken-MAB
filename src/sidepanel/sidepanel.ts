@@ -24,6 +24,7 @@ import {
   renderTabBar,
   renderTabPanel,
   currentPnl,
+  type ManualBuyUiState,
   type ManualCloseUiState,
   type PreviewCloseUiState,
   type TabId,
@@ -44,6 +45,8 @@ let latestOrderFormDiagnosticsError: string | null = null;
 let selectedTab: TabId = "positions";
 let previewCloseState: PreviewCloseUiState = { message: null, error: null };
 let manualCloseState: ManualCloseUiState = { pending: null };
+let manualBuyState: ManualBuyUiState = { pending: null };
+let manualBuyMessage: { message: string | null; error: string | null } = { message: null, error: null };
 
 function isTabId(value: unknown): value is TabId {
   return value === "positions" || value === "market" || value === "notifications" || value === "settings";
@@ -86,6 +89,17 @@ async function render(): Promise<void> {
     },
     onContinueManualClose: () => void continueManualClose(),
     onConfirmManualClose: () => void confirmManualClose(),
+    onUpdateWatchlist: (symbols: string[]) => void updateWatchlist(symbols),
+    onRequestManualBuy: (symbol: string, quantityUnits: number, currentPrice: number | null) =>
+      requestManualBuy(symbol, quantityUnits, currentPrice),
+    onUpdateManualBuyQuantity: (quantityUnits: number) => updateManualBuyQuantity(quantityUnits),
+    onCancelManualBuy: () => {
+      manualBuyState = { pending: null };
+      manualBuyMessage = { message: "Test buy cancelled.", error: null };
+      void render();
+    },
+    onContinueManualBuy: () => void continueManualBuy(),
+    onConfirmManualBuy: () => void confirmManualBuy(),
     onClearLogs: () => void clearLogsWithConfirmation(),
   };
 
@@ -119,9 +133,7 @@ async function render(): Promise<void> {
   } else if (selectedTab === "market") {
     app.append(
       renderTabPanel("market", [
-        renderInterestedCoinsPanel(state, now, {
-          onUpdateWatchlist: (symbols) => void updateWatchlist(symbols),
-        }),
+        renderInterestedCoinsPanel(state, now, controls, manualBuyState, manualBuyMessage),
       ])
     );
   } else if (selectedTab === "notifications") {
@@ -373,6 +385,94 @@ async function confirmManualClose(): Promise<void> {
   } else {
     manualCloseState = { pending: { ...pending, phase: "MODAL_VALIDATED" } };
     previewCloseState = { message: null, error: "Unexpected final close response." };
+  }
+  await requestState();
+}
+
+/** Starts a supervised, manual test of the real buy-execution path — the
+ * only way to trigger a buy today besides Autopilot's fully-automatic one.
+ * quantityUnits defaults to the suggested size but is editable in the
+ * INITIAL_CONFIRM phase, since this is for proving out the mechanism, not
+ * necessarily committing to the full suggested amount. */
+function requestManualBuy(symbol: string, quantityUnits: number, currentPrice: number | null): void {
+  manualBuyState = {
+    pending: { symbol, quantityUnits, currentPrice, phase: "INITIAL_CONFIRM", modalSummary: null },
+  };
+  manualBuyMessage = { message: null, error: null };
+  void render();
+}
+
+function updateManualBuyQuantity(quantityUnits: number): void {
+  if (!manualBuyState.pending) return;
+  manualBuyState = { pending: { ...manualBuyState.pending, quantityUnits } };
+}
+
+async function continueManualBuy(): Promise<void> {
+  const pending = manualBuyState.pending;
+  if (!pending) return;
+  manualBuyMessage = { message: `Opening buy order for ${pending.symbol}...`, error: null };
+  await render();
+
+  const response: unknown = await chrome.runtime.sendMessage({
+    type: "OPEN_BUY_ORDER",
+    symbol: pending.symbol,
+    quantityUnits: pending.quantityUnits,
+  });
+  if (isExtensionMessage(response) && response.type === "OPEN_BUY_ORDER_RESULT") {
+    if (response.report?.ready) {
+      const confirmedQuantity = response.report.quantitySet ?? pending.quantityUnits;
+      manualBuyState = {
+        pending: {
+          ...pending,
+          quantityUnits: confirmedQuantity,
+          phase: "MODAL_VALIDATED",
+          modalSummary:
+            `Quantity ${confirmedQuantity} ${pending.symbol}. ` +
+            `${response.report.modalValidation?.finalControlText ?? "Confirm button found."}`,
+        },
+      };
+      manualBuyMessage = { message: "Kraken buy confirmation validated.", error: null };
+    } else {
+      manualBuyMessage = {
+        message: null,
+        error: response.report?.blockedReason ?? response.error ?? "Open Buy Order was blocked.",
+      };
+    }
+  } else {
+    manualBuyMessage = { message: null, error: "Unexpected open-buy-order response." };
+  }
+  await requestState();
+}
+
+async function confirmManualBuy(): Promise<void> {
+  const pending = manualBuyState.pending;
+  if (!pending || pending.phase !== "MODAL_VALIDATED") return;
+  manualBuyState = { pending: { ...pending, phase: "SUBMITTING" } };
+  manualBuyMessage = { message: `Submitting buy for ${pending.symbol}...`, error: null };
+  await render();
+
+  const response: unknown = await chrome.runtime.sendMessage({
+    type: "CONFIRM_BUY_ORDER",
+    symbol: pending.symbol,
+    quantityUnits: pending.quantityUnits,
+  });
+  if (isExtensionMessage(response) && response.type === "CONFIRM_BUY_ORDER_RESULT") {
+    if (response.clicked && response.modalValidation?.ready) {
+      manualBuyState = { pending: null };
+      manualBuyMessage = {
+        message: `Clicked Confirm for ${pending.symbol}. Verify the order on Kraken.`,
+        error: null,
+      };
+    } else {
+      manualBuyState = { pending: { ...pending, phase: "MODAL_VALIDATED" } };
+      manualBuyMessage = {
+        message: null,
+        error: response.modalValidation?.blockedReason ?? response.error ?? "Confirm Buy was blocked.",
+      };
+    }
+  } else {
+    manualBuyState = { pending: { ...pending, phase: "MODAL_VALIDATED" } };
+    manualBuyMessage = { message: null, error: "Unexpected confirm-buy response." };
   }
   await requestState();
 }

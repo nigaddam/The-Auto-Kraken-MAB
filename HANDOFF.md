@@ -1207,3 +1207,167 @@ eyeballed against Kraken's own display.
 
 All four gates pass: `npm run typecheck`, `npm run lint`, `npm test`
 (244/244, up from 198), `npm run build`.
+
+## 23. Addendum: real buy-order automation (this session) — UNTESTED against live Kraken
+
+The user asked to automate the buy side. Per this project's own repeated
+lesson (guessing at unseen Kraken markup produced a regex bug and a full
+row-discovery rewrite), this was gated on the user running **Order-Form
+Diagnostics** for real against the Buy tab and sharing the report before
+any click code was written — done twice (once before a fix, once after,
+confirming the fix). Two real bugs were found from that real data and
+fixed in `order-form-diagnostics.ts` before building on it:
+
+1. **Quantity input undetectable** — Kraken's real quantity `<input>` has
+   no `aria-label`/`placeholder`/`name`/`data-testid` at all, only a nearby
+   "Quantity" text label with no programmatic link. `findQuantityInput`
+   (now backed by a new `findLabeledInput`) falls back to a label-anchored
+   search: find the label text, then look for the nearest `<input>` within
+   a few ancestor levels — same "label:value fallback" convention already
+   used by `findLabeledText` for the position parser.
+2. **Submit button falsely "ambiguous"** — the Buy *tab* button's
+   accessible name is literally "Buy", which the submit-button keyword
+   search also matched, alongside the real submit button. Fixed by
+   excluding the already-identified tab/order-type elements (by reference)
+   from the submit-control search.
+
+The user also confirmed live (screenshot) that clicking submit shows a
+real Kraken confirmation modal ("Market long 0.001 BTC ... Cancel |
+Confirm") before anything executes — the same two-step gate the close
+flow already relies on, so the buy flow could mirror it exactly. **Critical
+operational note the user must never violate**: that modal has a "Don't
+show this confirmation again" checkbox — if it's ever checked on this
+account, Kraken would skip the confirmation entirely and the safety
+checkpoint this whole design depends on disappears. The automation itself
+never touches that checkbox.
+
+**New file `src/content/buy-preview.ts`** — mirrors `close-preview.ts`'s
+exact resolve → open/validate → confirm pattern:
+- `openKrakenBuyOrder(root, symbol, quantityUnits)`: verifies the order
+  panel actually references the requested symbol (wrong-page defense),
+  ensures Buy is selected (only clicks if `tabSelectedState` explicitly
+  reads not-selected — real evidence confirmed Buy/Sell tab state IS
+  readable), always explicitly clicks Market (order-type selected-state
+  came back `"UNKNOWN"` in diagnostics, so this never trusts an assumed
+  state), sets the quantity via the native React-controlled-input setter
+  trick (`Object.getOwnPropertyDescriptor(...).set.call(...)` + dispatched
+  `input`/`change` events — required because assigning `.value` directly
+  doesn't notify React), reads the value back and blocks if it didn't take,
+  clicks submit, then waits for and validates the resulting confirmation
+  modal. Never clicks the modal's own Confirm button — that's a
+  deliberately separate step.
+- `validateBuyModal`/`confirmValidatedBuyOrder`: same evidence-based
+  approach as `validateCloseModal` (action wording, quantity match within
+  tolerance, exactly-one-Confirm-button, conflicting short/sell/close
+  wording blocks). **A real bug was caught by the test suite itself**:
+  Kraken concatenates quantity and symbol with no whitespace
+  ("0.001BTC" — same pattern already seen in Order-Form Diagnostics'
+  "QuantityJTO"), so a plain `\bBTC\b` regex never matched (no
+  word-boundary between a digit and a letter). Fixed with
+  `symbolBoundaryPattern()`, which only excludes an adjacent *letter* (so
+  "0.001BTC" matches but "SOMEBTCTOKEN" doesn't) — this was caught because
+  the test fixtures were built to mirror the real observed text exactly,
+  not an idealized "0.001 BTC" with a space that was never actually seen.
+- `dismissOpenModal()`/`sleep()` exported from `close-preview.ts` and
+  reused rather than duplicated.
+
+**Navigation, deliberately NOT via Kraken's own search widget**: Kraken's
+Trade-page URL directly encodes the pair (`.../trade/jto-usd`,
+`.../trade/btc-usd` — confirmed via the user's own screenshots; note this
+is the plain UI symbol, NOT the public API's XBT-for-BTC pair naming, so
+`buildTradeUrl()` deliberately does not reuse `resolvePublicMarket`'s
+`pairParam`). `service-worker.ts` gained `buildTradeUrl`/`buildPortfolioUrl`
+(derive the URL from whatever the current tab's URL already is — no
+hardcoded account ID), `navigateKrakenTab` (`chrome.tabs.update` + poll for
+`status: "complete"`), and `waitForOrderFormReady` (polls the existing
+read-only `RUN_ORDER_FORM_DIAGNOSTICS` message after navigation — the SPA
+needs a moment to render after tab status flips to complete, so this never
+assumes the instant tab-load-complete fires means the order form is ready).
+Chosen over automating Kraken's own market-search box specifically to avoid
+introducing an entirely new unvalidated click surface.
+
+**`processAutopilotBuys()`** (service-worker.ts) — deliberately
+conservative for this first pass: **at most one buy attempt per scan
+cycle** (never a batch loop like `processLiveAutoClose`'s), picking the
+highest-tier (`STRONG_BUY` over `BUY`) watchlist symbol with no existing
+position, `apiStatus === "OK"`, a positive `suggestedBuyUnits` from
+Phase 2's position-sizing math, and not on a per-symbol cooldown
+(`max(pollMinutes*3, 15)` minutes — a safety net for the position-detection
+lag right after a buy, not the primary "don't double-buy" mechanism, which
+is really that a bought symbol stops being a watchlist candidate the
+moment its new position is detected). Gated on the *exact same*
+`executionMode === "ARMED_AUTO_CLOSE" && autoCloseLive` flag the sell side
+already uses — buy execution inherits every existing precondition
+(preflight pass, keep-awake active, session logged in, no unresolved sleep
+gap, tab present) for free, with zero new arming ceremony. Runs after
+`refreshMarketData()` in `processScanResult` so `signalStates`/`marketData`
+for watchlist symbols are freshly computed the same cycle before deciding.
+After the attempt (success, blocked, or uncertain), always navigates the
+tab back to Portfolio — position scanning has only ever been calibrated
+against that page, not the Trade page, so this never leaves monitoring
+depending on an unconfirmed page.
+
+**New `AuditEventType`s**: `AUTO_BUY_SUCCEEDED`, `AUTO_BUY_BLOCKED`,
+`AUTO_BUY_UNCERTAIN` — each also fires a Chrome notification and an
+execution webhook (`ExecutionNotificationDetails.mode` gained an
+`"AUTO_BUY"` variant, reusing `sendExecutionWebhook` rather than a
+parallel function). New `RuntimeState.autoBuyIntents: Record<symbol,
+timestamp>` for the per-symbol cooldown.
+
+**Explicitly NOT built this session**: any manual/supervised way to
+trigger a single test buy from the side panel. Right now the *only* path
+that can place a real buy order is Autopilot's fully-automatic one — there
+is no "Preview Buy" or "Test Buy" button analogous to the close flow's
+manual 3-phase UI, which was itself proven out manually before LIVE
+auto-close was trusted. Recommend adding one before relying on the
+automatic path unsupervised, or at minimum watching the very first
+Autopilot-triggered buy happen in person.
+
+**Testing**: `tests/order-form-diagnostics.test.ts` (5 tests) — fixture
+built from the real diagnostics JSON, verifying both bugs above stay
+fixed. `tests/buy-preview.test.ts` (12 tests) — covers
+`validateBuyModal`'s evidence branches (accept, quantity mismatch,
+conflicting wording, ambiguous modal/button count, never treats the
+"don't show again" checkbox as the final control), `confirmValidatedBuyOrder`
+(clicks Confirm only when ready, dismisses via Escape otherwise), and
+`openKrakenBuyOrder`'s full happy path plus three blocked-path cases
+(missing quantity input, ambiguous Market control, wrong-symbol page) —
+all against fixtures mirroring the real Kraken structure, not idealized
+HTML. **Everything above is unit/fixture-tested only — none of it has
+been exercised against the real, logged-in Kraken page.** Unlike the
+close flow (which has now been through several live-armed sessions per
+earlier addenda), this buy path has zero live-execution evidence yet.
+
+All four gates pass: `npm run typecheck`, `npm run lint`, `npm test`
+(264/264, up from 244), `npm run build`.
+
+**Same-session follow-up: manual "Test Buy" control.** Immediately after
+the above, the user was asked whether they wanted a supervised way to
+trigger one real buy before trusting Autopilot's fully-automatic path —
+they said yes. Added `ManualBuyUiState` and `renderManualBuyPanel`
+(components.ts), mirroring `ManualCloseUiState`/`renderManualClosePanel`'s
+exact 3-phase shape (`INITIAL_CONFIRM → MODAL_VALIDATED → SUBMITTING`).
+A **Test Buy** button appears on each manual (non-auto-tracked) watchlist
+card with a valid current price, seeded from that symbol's
+`suggestedBuyUnits` (falling back to a small ~$100-equivalent quantity if
+sizing is unavailable) — but the quantity is editable in the
+`INITIAL_CONFIRM` phase (a plain `<input type="number">`, wired via
+`onUpdateManualBuyQuantity`) precisely because this is for proving out the
+mechanism, not necessarily committing to the full suggested size.
+`continueManualBuy()`/`confirmManualBuy()` in `sidepanel.ts` send the exact
+same `OPEN_BUY_ORDER`/`CONFIRM_BUY_ORDER` messages Autopilot itself uses —
+this is not a separate code path, it exercises the identical
+`buy-preview.ts` logic under manual, one-click-at-a-time supervision.
+`renderInterestedCoinsPanel`'s signature changed from a narrow custom
+handlers object to the shared `ControlHandlers` type (now also carrying
+`onUpdateWatchlist`), matching every other render function's convention;
+`sidepanel.ts`'s Market-tab render call now passes the same aggregated
+`controls` object used everywhere else instead of a one-off literal.
+
+**Testing**: 4 new tests in `tests/sidepanel-ui.test.ts` — Test Buy button
+presence/absence (shown only with valid price data) and wiring, and both
+manual-buy panel phases (editable-quantity INITIAL_CONFIRM,
+Confirm-Buy-clicks-through MODAL_VALIDATED).
+
+All four gates pass: `npm run typecheck`, `npm run lint`, `npm test`
+(268/268, up from 264), `npm run build`.

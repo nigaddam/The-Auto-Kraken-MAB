@@ -368,6 +368,12 @@ export interface ControlHandlers {
   onCancelManualClose?: () => void;
   onContinueManualClose?: () => void;
   onConfirmManualClose?: () => void;
+  onRequestManualBuy?: (symbol: string, quantityUnits: number, currentPrice: number | null) => void;
+  onUpdateManualBuyQuantity?: (quantityUnits: number) => void;
+  onCancelManualBuy?: () => void;
+  onContinueManualBuy?: () => void;
+  onConfirmManualBuy?: () => void;
+  onUpdateWatchlist?: (symbols: string[]) => void;
   onClearLogs?: () => void;
 }
 
@@ -385,6 +391,23 @@ export interface ManualCloseUiState {
     currentPrice: number | null;
     valueUsd: number | null;
     netPnl: number | null;
+    phase: "INITIAL_CONFIRM" | "MODAL_VALIDATED" | "SUBMITTING";
+    modalSummary: string | null;
+  } | null;
+}
+
+/** Manual, supervised test of the buy-execution path (src/content/buy-preview.ts)
+ * — mirrors ManualCloseUiState's 3-phase shape exactly, since this is the
+ * same "prove out manually before trusting it fully-automatic" discipline
+ * the close flow itself went through. Quantity is editable in the
+ * INITIAL_CONFIRM phase (defaults to the suggested size, but this is
+ * explicitly for testing the mechanism, not necessarily committing to the
+ * full suggested amount). */
+export interface ManualBuyUiState {
+  pending: {
+    symbol: string;
+    quantityUnits: number;
+    currentPrice: number | null;
     phase: "INITIAL_CONFIRM" | "MODAL_VALIDATED" | "SUBMITTING";
     modalSummary: string | null;
   } | null;
@@ -713,6 +736,68 @@ function renderManualClosePanel(
   return panel;
 }
 
+/** Same 3-phase discipline as renderManualClosePanel, for a supervised test
+ * of the buy-execution path — this is deliberately the ONLY way to trigger
+ * a real buy today (Autopilot's automatic path is separate); see it as the
+ * manual proving-ground the close flow itself went through before LIVE
+ * auto-close was trusted. */
+function renderManualBuyPanel(state: ManualBuyUiState, handlers?: ControlHandlers): HTMLElement | null {
+  const pending = state.pending;
+  if (!pending) return null;
+
+  const panel = el("section", "manual-close-panel stack");
+  panel.append(
+    el(
+      "h2",
+      undefined,
+      pending.phase === "MODAL_VALIDATED" || pending.phase === "SUBMITTING"
+        ? "Kraken Buy Confirmation Validated"
+        : `Test Buy ${pending.symbol}?`
+    )
+  );
+  panel.append(row("Current price", fmtPrice(pending.currentPrice)));
+
+  if (pending.phase === "INITIAL_CONFIRM") {
+    const qtyRow = el("div", "row");
+    qtyRow.append(el("span", undefined, "Quantity"));
+    const qtyInput = document.createElement("input");
+    qtyInput.type = "number";
+    qtyInput.step = "any";
+    qtyInput.min = "0";
+    qtyInput.value = String(pending.quantityUnits);
+    qtyInput.addEventListener("input", () => {
+      const parsed = Number(qtyInput.value);
+      if (Number.isFinite(parsed) && parsed > 0) {
+        handlers?.onUpdateManualBuyQuantity?.(parsed);
+      }
+    });
+    qtyRow.append(qtyInput);
+    panel.append(qtyRow);
+    const estUsd = pending.currentPrice !== null ? pending.quantityUnits * pending.currentPrice : null;
+    panel.append(row("Estimated total", estUsd !== null ? fmtUsd(estUsd) : "-"));
+  } else {
+    panel.append(row("Quantity", `${pending.quantityUnits} ${pending.symbol}`));
+  }
+
+  if (pending.modalSummary) panel.append(el("div", "success-text", pending.modalSummary));
+
+  const actions = el("div", "controls");
+  const cancel = el("button", undefined, "Cancel");
+  cancel.addEventListener("click", () => handlers?.onCancelManualBuy?.());
+  const action =
+    pending.phase === "MODAL_VALIDATED" || pending.phase === "SUBMITTING"
+      ? el("button", "primary", pending.phase === "SUBMITTING" ? "Confirming..." : "Confirm Buy")
+      : el("button", "primary", "Open Kraken Buy Order");
+  action.disabled = pending.phase === "SUBMITTING";
+  action.addEventListener("click", () => {
+    if (pending.phase === "MODAL_VALIDATED") handlers?.onConfirmManualBuy?.();
+    if (pending.phase === "INITIAL_CONFIRM") handlers?.onContinueManualBuy?.();
+  });
+  actions.append(cancel, action);
+  panel.append(actions);
+  return panel;
+}
+
 export function renderPositionsSection(
   state: RuntimeState,
   now: number,
@@ -777,10 +862,17 @@ const WATCHLIST_SYMBOL_PATTERN = /^[A-Z][A-Z0-9]{1,9}$/;
 export function renderInterestedCoinsPanel(
   state: RuntimeState,
   now: number,
-  handlers?: { onUpdateWatchlist?: (symbols: string[]) => void }
+  handlers?: ControlHandlers,
+  manualBuyState: ManualBuyUiState = { pending: null },
+  manualBuyMessage: { message: string | null; error: string | null } = { message: null, error: null }
 ): HTMLElement {
   const panel = el("section", "panel stack");
   panel.append(el("h2", undefined, "Interested Kraken Coins"));
+
+  if (manualBuyMessage.message) panel.append(el("div", "success-text", manualBuyMessage.message));
+  if (manualBuyMessage.error) panel.append(el("div", "warn-text", manualBuyMessage.error));
+  const manualBuyPanel = renderManualBuyPanel(manualBuyState, handlers);
+  if (manualBuyPanel) panel.append(manualBuyPanel);
 
   const autoTrackedSymbols = [...new Set(activePositions(state).map((p) => p.symbol))].sort();
   const manualSymbols = state.settings.watchlistCoins.filter(
@@ -908,6 +1000,18 @@ export function renderInterestedCoinsPanel(
       ),
       row("Last checked", fmtAge(row_.lastUpdatedAt, now))
     );
+    if (handlers?.onRequestManualBuy && row_.currentApiPrice !== null) {
+      const seedQuantity = row_.suggestedBuyUnits ?? 100 / row_.currentApiPrice;
+      const testBuyBtn = el("button", "small-button", "Test Buy");
+      testBuyBtn.type = "button";
+      testBuyBtn.title = "Manually walks through the real buy-execution flow for a supervised test.";
+      testBuyBtn.addEventListener("click", () =>
+        handlers.onRequestManualBuy?.(symbol, seedQuantity, row_.currentApiPrice)
+      );
+      const actions = el("div", "lot-actions");
+      actions.append(testBuyBtn);
+      card.append(actions);
+    }
     panel.append(card);
   }
   return panel;

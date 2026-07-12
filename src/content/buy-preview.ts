@@ -59,6 +59,18 @@ function findModalCandidates(root: ParentNode): Element[] {
   ).filter((el) => textOf(el).length > 0);
 }
 
+/** Real Kraken evidence shows quantity and symbol are sometimes concatenated
+ * with no whitespace between them (e.g. "0.001BTC", same pattern already
+ * seen in Order-Form Diagnostics' "QuantityJTO") — a plain `\bSYMBOL\b`
+ * regex never matches there, since `\b` doesn't fire between two word
+ * characters (a digit and a letter both count as word characters). This
+ * only excludes a letter immediately adjacent (so "0.001BTC" matches, but
+ * "SOMEBTCTOKEN" does not), which is the actual ambiguity this needs to
+ * avoid, not digit-adjacency. */
+function symbolBoundaryPattern(symbolUpper: string): string {
+  return `(?<![A-Za-z])${symbolUpper}(?![A-Za-z])`;
+}
+
 function findConfirmControls(modal: Element): HTMLElement[] {
   return Array.from(modal.querySelectorAll<HTMLElement>('button, [role="button"]')).filter((el) => {
     const label = el.getAttribute("aria-label") ?? el.getAttribute("title") ?? textOf(el);
@@ -74,7 +86,8 @@ function findConfirmControls(modal: Element): HTMLElement[] {
 export function validateBuyModal(root: ParentNode, symbol: string, expectedQuantity: number): BuyModalValidation {
   const symbolUpper = symbol.toUpperCase();
   const candidates = findModalCandidates(root);
-  const matching = candidates.filter((modal) => new RegExp(`\\b${symbolUpper}\\b`).test(textOf(modal)));
+  const symbolPattern = symbolBoundaryPattern(symbolUpper);
+  const matching = candidates.filter((modal) => new RegExp(symbolPattern, "i").test(textOf(modal)));
 
   const base = {
     modalFound: matching.length > 0,
@@ -101,7 +114,7 @@ export function validateBuyModal(root: ParentNode, symbol: string, expectedQuant
   const text = textOf(modal);
   const actionMatched = /\blong\b/i.test(text);
   const conflictingActionFound = /\b(short|sell|close\s*position|increase\s*leverage|add\s*margin)\b/i.test(text);
-  const quantityMatch = text.match(new RegExp(`([\\d,.]+)\\s*${symbolUpper}\\b`, "i"));
+  const quantityMatch = text.match(new RegExp(`([\\d,.]+)\\s*${symbolPattern}`, "i"));
   const quantityParsed = quantityMatch ? Number(quantityMatch[1]!.replace(/,/g, "")) : null;
   const quantityMatched =
     quantityParsed !== null &&
@@ -211,7 +224,7 @@ export async function openKrakenBuyOrder(
 
   let panel = findOrderEntryPanel(root);
   if (!panel) return blocked("Order entry panel was not found.");
-  if (!new RegExp(`\\b${symbolUpper}\\b`).test(textOf(panel))) {
+  if (!new RegExp(symbolBoundaryPattern(symbolUpper), "i").test(textOf(panel))) {
     return blocked(`Order entry panel does not appear to reference ${symbolUpper}; wrong page?`);
   }
 
@@ -302,7 +315,7 @@ export function confirmValidatedBuyOrder(
   }
   const symbolUpper = symbol.toUpperCase();
   const modal = findModalCandidates(root).find((candidate) =>
-    new RegExp(`\\b${symbolUpper}\\b`).test(textOf(candidate))
+    new RegExp(symbolBoundaryPattern(symbolUpper), "i").test(textOf(candidate))
   );
   const controls = modal ? findConfirmControls(modal) : [];
   if (controls.length !== 1) {
