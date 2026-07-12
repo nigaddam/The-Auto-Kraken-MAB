@@ -1,0 +1,30 @@
+{
+  "manifest_version": 3,
+  "name": "Kraken Overnight Guard",
+  "version": "0.1.0",
+  "description": "Monitors Kraken Prop LONG positions and can close existing LONG positions only after explicit manual confirmation or LIVE Auto-Close arming. Never opens, shorts, increases positions, or automates login.",
+  "permissions": ["storage", "alarms", "notifications", "sidePanel", "tabs", "power", "scripting"],
+  "host_permissions": ["https://pro.kraken.com/*", "https://api.kraken.com/*", "https://ntfy.sh/*"],
+  "background": {
+    "service_worker": "service-worker.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://pro.kraken.com/prop/*"],
+      "js": ["content-script.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "action": {
+    "default_title": "Kraken Overnight Guard"
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
