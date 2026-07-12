@@ -29,16 +29,19 @@ import type {
   CloseExecutionRecord,
   CloseExecutionState,
   LiveAutoClosePreflightResult,
+  OperatingMode,
   RuntimeState,
   TrackedPosition,
 } from "../shared/types";
 import { checkPriceTolerance, validateCandles } from "../shared/validation";
 import {
   computeCurrentReturnPct,
+  determineTrend,
   evaluateVolatilityAdjustedStrategy,
   isNewCloseTransition,
 } from "../strategy/exit-strategy";
 import { reconcilePositions } from "../strategy/state-machine";
+import { classifySignalTier, isNewSignalEscalation } from "../strategy/signal-engine";
 import { appendAuditEntry, clearAuditLog, exportAuditLogAsJson } from "../storage/audit-log";
 import { getState, updateState } from "../storage/state";
 import { buildMarketDataTable } from "./market-data-table";
@@ -52,11 +55,12 @@ import {
 import { notify } from "./notifications";
 import { releaseSystemKeepAwake, requestSystemKeepAwake } from "./power";
 import { checkStall } from "./watchdog";
-import { sendBuySignalWebhook, sendExecutionWebhook } from "./execution-notify";
+import { sendBuySignalWebhook, sendExecutionWebhook, sendSignalTierWebhook } from "./execution-notify";
 import { evaluateWatchlistBuySignals } from "./watchlist-buy-signals";
 
 let pendingManualPositionRefresh = false;
 let autoCloseInFlight = false;
+let autoBuyInFlight = false;
 
 function makeAuditEntry(
   state: RuntimeState,
@@ -82,6 +86,7 @@ function makeAuditEntry(
     reason,
     executionResult: null,
     errorDetails: null,
+    realizedPnlUsd: null,
     ...partial,
   };
 }
@@ -220,7 +225,7 @@ async function resetToSafeDefaultsOnRestart(): Promise<void> {
         : "Monitoring resumed in Monitor Only mode after a restart."
     );
     await broadcastState(withKeepAwake);
-    await runScanCycle();
+    await runScanCycle({ autopilotResetStats: true });
   } else if (wasMonitoring) {
     await appendAuditEntry(
       makeAuditEntry(
@@ -290,7 +295,14 @@ async function disarmLiveAutoClose(
       }
     )
   );
-  await notify("LIVE Auto-Close disarmed", reason, { urgent: true });
+  // In AUTOPILOT, this disarm is expected to be transient — runScanCycle's
+  // tryAutopilotArm re-attempts every cycle and has its own one-shot "still
+  // waiting to arm" notification (autopilotReArmFailedSince) so a blip
+  // doesn't produce two urgent pushes. Outside AUTOPILOT (e.g. the old
+  // direct ARM_AUTO_CLOSE flow), this is still the only disarm notice.
+  if (next.operatingMode !== "AUTOPILOT") {
+    await notify("LIVE Auto-Close disarmed", reason, { urgent: true });
+  }
   await broadcastState(next);
 }
 
@@ -741,7 +753,11 @@ async function canArmLiveAutoClose(): Promise<LiveAutoClosePreflightResult> {
   return result;
 }
 
-async function handleArmAutoClose(durationHours: number, live: boolean): Promise<void> {
+async function handleArmAutoClose(
+  durationHours: number,
+  live: boolean,
+  resetStats = true
+): Promise<void> {
   const now = Date.now();
   const state = await getState();
   if (state.monitoringStatus !== "RUNNING") {
@@ -772,7 +788,9 @@ async function handleArmAutoClose(durationHours: number, live: boolean): Promise
           }
         )
       );
-      await notify("LIVE Auto-Close blocked", preflight.blockers.join(" "), { urgent: true });
+      if (blocked.operatingMode !== "AUTOPILOT") {
+        await notify("LIVE Auto-Close blocked", preflight.blockers.join(" "), { urgent: true });
+      }
       return;
     }
   }
@@ -787,13 +805,21 @@ async function handleArmAutoClose(durationHours: number, live: boolean): Promise
     armedUntil,
     autoCloseLive: live,
     autoCloseDryRunIntents: {},
-    liveAutoCloseStats: {
-      armedSessionStartedAt: now,
-      closesThisSession: 0,
-      closeTimestamps: [],
-      unresolvedSleepGap: false,
-      previousExecutionUncertain: false,
-    },
+    // Correctness-critical: resetStats is only true for a fresh, explicit
+    // arm (user turning Autopilot on, or the old direct ARM_AUTO_CLOSE
+    // flow). Autopilot's own self-healing re-arm (tryAutopilotArm, after a
+    // transient disarm) passes false so a brief blip can't silently wipe
+    // the hourly/session rate-limit counters and defeat
+    // maxLiveClosesPerHour/maxLiveClosesPerArmedSession.
+    liveAutoCloseStats: resetStats
+      ? {
+          armedSessionStartedAt: now,
+          closesThisSession: 0,
+          closeTimestamps: [],
+          unresolvedSleepGap: false,
+          previousExecutionUncertain: false,
+        }
+      : s.liveAutoCloseStats,
   }));
   await appendAuditEntry(
     makeAuditEntry(
@@ -802,13 +828,15 @@ async function handleArmAutoClose(durationHours: number, live: boolean): Promise
       `Auto-Close ${live ? "LIVE" : "dry-run"} armed for ${hours} hour(s).`
     )
   );
-  await notify(
-    live ? "LIVE Auto-Close armed" : "Auto-Close armed",
-    live
-      ? "Live mode is armed. Current validated CLOSE signals may close Kraken positions automatically."
-      : "Dry-run mode is armed. It will log validated close intents but will not click final Kraken confirmation.",
-    { urgent: live }
-  );
+  if (resetStats) {
+    await notify(
+      live ? "LIVE Auto-Close armed" : "Auto-Close armed",
+      live
+        ? "Live mode is armed. Current validated CLOSE signals may close Kraken positions automatically."
+        : "Dry-run mode is armed. It will log validated close intents but will not click final Kraken confirmation.",
+      { urgent: live }
+    );
+  }
   await broadcastState(next);
 }
 
@@ -913,6 +941,73 @@ async function handleStopMonitoring(): Promise<void> {
   await broadcastState(next);
 }
 
+/** Autopilot's self-healing (re-)arm: called once when the user turns
+ * Autopilot on (resetStats: true) and again at the end of every scan cycle
+ * (resetStats: false) so a transient disarm (stale data, sleep gap, tab
+ * hiccup, etc.) recovers on its own next cycle instead of requiring a
+ * manual re-arm click. Only ever a no-op or a real preflight-gated arm —
+ * never skips or weakens canArmLiveAutoClose. */
+async function tryAutopilotArm(options: { resetStats: boolean }): Promise<void> {
+  const state = await getState();
+  if (state.operatingMode !== "AUTOPILOT") return;
+  if (state.executionMode === "ARMED_AUTO_CLOSE" && state.autoCloseLive) return;
+
+  const preflight = await canArmLiveAutoClose();
+  if (!preflight.allowed) {
+    if (state.autopilotReArmFailedSince === null) {
+      await notify("Autopilot paused", `Waiting to (re-)arm: ${preflight.blockers.join(" ")}`, {
+        urgent: true,
+      });
+      const marked = await updateState((s) => ({ ...s, autopilotReArmFailedSince: Date.now() }));
+      await broadcastState(marked);
+    }
+    return;
+  }
+
+  await handleArmAutoClose(state.settings.autoCloseDurationHours, true, options.resetStats);
+  const cleared = await updateState((s) => ({ ...s, autopilotReArmFailedSince: null }));
+  await broadcastState(cleared);
+}
+
+/** The simplified Off/Cruise/Autopilot control. A thin layer on top of the
+ * existing monitoringStatus/executionMode/autoCloseLive/armedUntil
+ * machinery — none of that internal shape changes. */
+async function setOperatingMode(mode: OperatingMode): Promise<void> {
+  const before = await getState();
+
+  if (mode === "OFF") {
+    if (before.monitoringStatus === "RUNNING") await handleStopMonitoring();
+    const next = await updateState((s) => ({
+      ...s,
+      operatingMode: "OFF",
+      autopilotReArmFailedSince: null,
+    }));
+    await broadcastState(next);
+    return;
+  }
+
+  if (before.monitoringStatus !== "RUNNING") await handleStartMonitoring();
+
+  if (mode === "CRUISE") {
+    const running = await getState();
+    if (running.executionMode === "ARMED_AUTO_CLOSE") {
+      await disarmAutoClose("Switched to Cruise mode.");
+    }
+    const next = await updateState((s) => ({
+      ...s,
+      operatingMode: "CRUISE",
+      autopilotReArmFailedSince: null,
+    }));
+    await broadcastState(next);
+    return;
+  }
+
+  // AUTOPILOT
+  await updateState((s) => ({ ...s, operatingMode: "AUTOPILOT" }));
+  await tryAutopilotArm({ resetStats: true });
+  await broadcastState(await getState());
+}
+
 async function requestScanFromTab(tabId: number): Promise<ScanResultMessage | null> {
   try {
     const raw: unknown = await sendMessageToKrakenTab(tabId, { type: "REQUEST_SCAN" });
@@ -923,7 +1018,18 @@ async function requestScanFromTab(tabId: number): Promise<ScanResultMessage | nu
   }
 }
 
-async function runScanCycle(): Promise<void> {
+async function runScanCycle(options: { autopilotResetStats?: boolean } = {}): Promise<void> {
+  await runScanCycleInner();
+  // Always give Autopilot a chance to (re-)arm at the end of the cycle,
+  // regardless of which path above returned — this is what turns every
+  // disarm condition into auto-pause/auto-resume instead of a hard stop
+  // requiring a manual click. resetStats is only true right after a real
+  // restart resumes Autopilot (see resetToSafeDefaultsOnRestart) — every
+  // routine cycle here is a self-heal, not a fresh arm.
+  await tryAutopilotArm({ resetStats: options.autopilotResetStats ?? false });
+}
+
+async function runScanCycleInner(): Promise<void> {
   const now = Date.now();
   const state = await getState();
   if (state.monitoringStatus !== "RUNNING") return;
@@ -932,12 +1038,27 @@ async function runScanCycle(): Promise<void> {
     state.armedUntil !== null &&
     state.armedUntil <= now
   ) {
-    if (state.autoCloseLive) {
+    if (state.operatingMode === "AUTOPILOT") {
+      // Self-renewing: Autopilot has no fixed-duration arming ceremony —
+      // roll the window forward instead of expiring. Every other disarm
+      // condition below is completely unaffected by this.
+      const hours =
+        Number.isFinite(state.settings.autoCloseDurationHours) &&
+        state.settings.autoCloseDurationHours > 0
+          ? Math.min(state.settings.autoCloseDurationHours, 24)
+          : 8;
+      const renewed = await updateState((s) => ({
+        ...s,
+        armedUntil: now + hours * 3600_000,
+      }));
+      await broadcastState(renewed);
+    } else if (state.autoCloseLive) {
       await disarmLiveAutoClose("LIVE Auto-Close arming duration expired.");
+      return;
     } else {
       await disarmAutoClose("Auto-Close arming duration expired.", "AUTO_CLOSE_EXPIRED");
+      return;
     }
-    return;
   }
   if (
     state.executionMode === "ARMED_AUTO_CLOSE" &&
@@ -1153,6 +1274,24 @@ async function evaluatePositions(
         blockingReasons,
       });
 
+      const tierResult = classifySignalTier({
+        regime: strategy.diagnostics.regime,
+        trend: determineTrend(strategy.diagnostics.sma7, strategy.diagnostics.sma30),
+        slope7: strategy.diagnostics.slope7,
+        goldenCrossNewlyConfirmed: false,
+        goldenCrossEpisodeActive: false,
+        exitDecision: strategy.decision,
+      });
+      const previousTier = state.signalStates[pos.symbol]?.tier ?? null;
+      const tierEscalated = isNewSignalEscalation(previousTier, tierResult.tier);
+      await updateState((s) => ({
+        ...s,
+        signalStates: {
+          ...s.signalStates,
+          [pos.symbol]: { tier: tierResult.tier, reason: tierResult.reason, updatedAt: now },
+        },
+      }));
+
       if (isNewCloseTransition(pos.decision, strategy.decision)) {
         await appendAuditEntry(
           makeAuditEntry(state, "SELL_CONDITION_TRIGGERED", strategy.reason, {
@@ -1169,9 +1308,23 @@ async function evaluatePositions(
             decision: strategy.decision,
           })
         );
-        await notify(
-          `${pos.symbol}: sell condition triggered`,
-          `${strategy.reason} Monitor Only mode — no trade control will be clicked.`
+        if (state.operatingMode === "CRUISE") {
+          await notify(`${pos.symbol}: sell condition triggered`, strategy.reason);
+        }
+      } else if (tierEscalated && tierResult.tier !== "HOLD" && state.operatingMode === "CRUISE") {
+        await appendAuditEntry(
+          makeAuditEntry(
+            state,
+            "SIGNAL_TIER_CHANGED",
+            `${pos.symbol}: ${previousTier ?? "HOLD"} -> ${tierResult.tier} (${tierResult.reason})`,
+            { symbol: pos.symbol, fingerprint: pos.fingerprint, decision: strategy.decision }
+          )
+        );
+        await notify(`${pos.symbol}: ${tierResult.tier}`, tierResult.reason);
+        await sendSignalTierWebhook(
+          state.settings.executionWebhookUrl,
+          { symbol: pos.symbol, tier: tierResult.tier, reason: tierResult.reason, timestamp: Date.now() },
+          state.settings.executionEmailAddress
         );
       }
       if (
@@ -1244,6 +1397,296 @@ async function evaluatePositions(
   }
 
   return next;
+}
+
+/** Extracts "/prop/account/<id>" from a Kraken Prop URL's pathname, so a
+ * trade-page or portfolio-page URL can be rebuilt from whatever page the
+ * tab is currently on, without ever hardcoding an account ID. */
+function krakenAccountPathPrefix(url: string): string | null {
+  try {
+    const match = new URL(url).pathname.match(/^(\/prop\/account\/[^/]+)\//);
+    return match ? match[1]! : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Kraken's own web UI uses the plain UI symbol in its Trade URLs (e.g.
+ * "btc-usd", "jto-usd" — confirmed via a real diagnostics run), which is
+ * NOT always the same as the public API's pair naming (BTC's API pair is
+ * XBTUSD) — deliberately does not reuse resolvePublicMarket's pairParam
+ * here for that reason. */
+function buildTradeUrl(currentUrl: string, symbol: string): string | null {
+  const prefix = krakenAccountPathPrefix(currentUrl);
+  if (!prefix) return null;
+  try {
+    const url = new URL(currentUrl);
+    url.pathname = `${prefix}/trade/${symbol.toLowerCase()}-usd`;
+    url.search = "";
+    url.hash = "";
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
+function buildPortfolioUrl(currentUrl: string): string | null {
+  const prefix = krakenAccountPathPrefix(currentUrl);
+  if (!prefix) return null;
+  try {
+    const url = new URL(currentUrl);
+    url.pathname = `${prefix}/portfolio`;
+    url.search = "";
+    url.hash = "";
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
+/** Navigates the Kraken tab to a specific URL (a real browser navigation,
+ * not a synthetic click on any in-page search widget — deliberately chosen
+ * over automating Kraken's own market-search box, which would be a whole
+ * additional unvalidated DOM surface). Polls chrome.tabs.get for
+ * status "complete" rather than relying on onUpdated event timing, mirroring
+ * this file's existing simple-polling style (see verifyCloseSubmitted). */
+async function navigateKrakenTab(tabId: number, url: string, timeoutMs = 10_000): Promise<boolean> {
+  try {
+    await chrome.tabs.update(tabId, { url });
+  } catch {
+    return false;
+  }
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      if (tab.status === "complete") return true;
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
+/** After a navigation, the content script re-injects and the SPA needs a
+ * moment to render the Trade page's order form — polls the existing
+ * read-only Order-Form Diagnostics message (never clicks/fills anything)
+ * until the panel is detected and clearly references the target symbol,
+ * rather than assuming the page is ready the instant tab status flips to
+ * "complete". */
+async function waitForOrderFormReady(tabId: number, symbol: string, timeoutMs = 8_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  const symbolPattern = new RegExp(`\\b${symbol.toUpperCase()}\\b`, "i");
+  while (Date.now() < deadline) {
+    try {
+      const raw = await sendMessageToKrakenTab(tabId, { type: "RUN_ORDER_FORM_DIAGNOSTICS" });
+      if (
+        isExtensionMessage(raw) &&
+        raw.type === "ORDER_FORM_DIAGNOSTICS_RESULT" &&
+        raw.report?.orderEntryPanelDetected &&
+        raw.report.buyTabControl?.found &&
+        symbolPattern.test(raw.report.rawPanelTextExcerpt ?? "")
+      ) {
+        return true;
+      }
+    } catch {
+      // Content script may not be re-injected yet immediately after
+      // navigation; keep retrying until the deadline.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 400));
+  }
+  return false;
+}
+
+/** Picks at most one Autopilot buy candidate per cycle — a watchlist
+ * symbol (no existing position; once bought, position detection excludes
+ * it from this list entirely on its own) at BUY/STRONG_BUY tier, under its
+ * position-size cap, not on cooldown. Deliberately conservative for this
+ * first pass: exactly one buy attempt per scan cycle (never a batch loop
+ * like processLiveAutoClose's), using the normal cycle cadence itself as
+ * the rate limiter while this surface is new. Gated on the exact same
+ * "really armed" flag (executionMode/autoCloseLive) the sell side already
+ * uses, so buy execution inherits every existing precondition (preflight
+ * pass, keep-awake active, session logged in, no unresolved sleep gap,
+ * tab present) for free. */
+async function processAutopilotBuys(state: RuntimeState): Promise<void> {
+  if (state.operatingMode !== "AUTOPILOT") return;
+  if (state.executionMode !== "ARMED_AUTO_CLOSE" || !state.autoCloseLive) return;
+  if (autoBuyInFlight) return;
+  if (state.closeExecution && !isExecutionTerminal(state.closeExecution.state)) return;
+
+  const now = Date.now();
+  const cooldownMs = Math.max(state.settings.pollMinutes * 3, 15) * 60_000;
+  const activeSymbols = new Set(
+    Object.values(state.positions)
+      .filter((p) => p.status === "ACTIVE")
+      .map((p) => p.symbol)
+  );
+
+  const tierRank: Record<string, number> = { STRONG_BUY: 2, BUY: 1 };
+  const candidate = state.settings.watchlistCoins
+    .filter((symbol) => !activeSymbols.has(symbol))
+    .map((symbol) => ({ symbol, tier: state.signalStates[symbol]?.tier, row: state.marketData[symbol] }))
+    .filter(
+      (c): c is { symbol: string; tier: "BUY" | "STRONG_BUY"; row: NonNullable<typeof c.row> } =>
+        (c.tier === "BUY" || c.tier === "STRONG_BUY") &&
+        c.row !== undefined &&
+        c.row.apiStatus === "OK" &&
+        !c.row.atOrAboveSizeCap &&
+        c.row.suggestedBuyUnits !== null &&
+        c.row.suggestedBuyUnits > 0
+    )
+    .filter((c) => {
+      const last = state.autoBuyIntents[c.symbol];
+      return !last || now - last > cooldownMs;
+    })
+    .sort((a, b) => tierRank[b.tier]! - tierRank[a.tier]!)[0];
+
+  if (!candidate) return;
+  const quantityUnits = candidate.row.suggestedBuyUnits!;
+
+  autoBuyInFlight = true;
+  try {
+    await updateState((s) => ({
+      ...s,
+      autoBuyIntents: { ...s.autoBuyIntents, [candidate.symbol]: now },
+    }));
+
+    const tab = await findKrakenTab();
+    if (!tab || tab.id === undefined) return;
+    const originalUrl = tab.url ?? "";
+    const returnToUrl = buildPortfolioUrl(originalUrl) ?? originalUrl;
+
+    const fail = async (reason: string): Promise<void> => {
+      await appendAuditEntry(
+        makeAuditEntry(state, "AUTO_BUY_BLOCKED", `${candidate.symbol}: ${reason}`, {
+          symbol: candidate.symbol,
+          executionResult: "BLOCKED",
+          errorDetails: reason,
+        })
+      );
+      await notify(`${candidate.symbol}: auto-buy blocked`, reason, { urgent: true });
+      await sendExecutionWebhook(state.settings.executionWebhookUrl, {
+        symbol: candidate.symbol,
+        lotLabel: null,
+        result: "FAILURE",
+        mode: "AUTO_BUY",
+        reason,
+        entryPrice: null,
+        currentPrice: candidate.row.currentApiPrice,
+        currentReturnPct: null,
+        details: [],
+        timestamp: Date.now(),
+      });
+    };
+
+    const tradeUrl = buildTradeUrl(originalUrl, candidate.symbol);
+    if (!tradeUrl) {
+      await fail(`Could not build a trade-page URL for ${candidate.symbol} from the current tab URL.`);
+      return;
+    }
+
+    if (!(await navigateKrakenTab(tab.id, tradeUrl))) {
+      await fail(`Navigation to ${candidate.symbol}'s trade page did not complete in time.`);
+      return;
+    }
+    if (!(await waitForOrderFormReady(tab.id, candidate.symbol))) {
+      await fail(`Order form for ${candidate.symbol} was not ready after navigating.`);
+      await navigateKrakenTab(tab.id, returnToUrl);
+      return;
+    }
+
+    const openRaw = await sendMessageToKrakenTab(tab.id, {
+      type: "OPEN_BUY_ORDER",
+      symbol: candidate.symbol,
+      quantityUnits,
+    });
+    if (!isExtensionMessage(openRaw) || openRaw.type !== "OPEN_BUY_ORDER_RESULT" || !openRaw.report?.ready) {
+      const reason =
+        isExtensionMessage(openRaw) && openRaw.type === "OPEN_BUY_ORDER_RESULT"
+          ? (openRaw.report?.blockedReason ?? openRaw.error ?? "unknown")
+          : "no response from content script";
+      await fail(`${reason}`);
+      await navigateKrakenTab(tab.id, returnToUrl);
+      return;
+    }
+
+    const confirmedQuantity = openRaw.report.quantitySet ?? quantityUnits;
+    const confirmRaw = await sendMessageToKrakenTab(tab.id, {
+      type: "CONFIRM_BUY_ORDER",
+      symbol: candidate.symbol,
+      quantityUnits: confirmedQuantity,
+    });
+    await navigateKrakenTab(tab.id, returnToUrl);
+
+    if (
+      isExtensionMessage(confirmRaw) &&
+      confirmRaw.type === "CONFIRM_BUY_ORDER_RESULT" &&
+      confirmRaw.clicked &&
+      confirmRaw.modalValidation?.ready
+    ) {
+      const succeeded = await getState();
+      await appendAuditEntry(
+        makeAuditEntry(
+          succeeded,
+          "AUTO_BUY_SUCCEEDED",
+          `${candidate.symbol} Autopilot buy submitted (~${confirmedQuantity} units).`,
+          { symbol: candidate.symbol, executionResult: "SUCCESS" }
+        )
+      );
+      await notify(
+        `${candidate.symbol} auto-bought`,
+        `Autopilot placed a market buy for ~${confirmedQuantity} ${candidate.symbol}.`,
+        { urgent: true }
+      );
+      await sendExecutionWebhook(succeeded.settings.executionWebhookUrl, {
+        symbol: candidate.symbol,
+        lotLabel: null,
+        result: "SUCCESS",
+        mode: "AUTO_BUY",
+        reason: candidate.tier === "STRONG_BUY" ? "STRONG_BUY signal" : "BUY signal",
+        entryPrice: candidate.row.currentApiPrice,
+        currentPrice: candidate.row.currentApiPrice,
+        currentReturnPct: null,
+        details: [],
+        timestamp: Date.now(),
+      });
+    } else {
+      const reason =
+        isExtensionMessage(confirmRaw) && confirmRaw.type === "CONFIRM_BUY_ORDER_RESULT"
+          ? (confirmRaw.modalValidation?.blockedReason ?? confirmRaw.error ?? "unknown")
+          : "no response from content script";
+      const uncertainState = await getState();
+      await appendAuditEntry(
+        makeAuditEntry(
+          uncertainState,
+          "AUTO_BUY_UNCERTAIN",
+          `${candidate.symbol}: ${reason} — verify manually on Kraken.`,
+          { symbol: candidate.symbol, executionResult: "FAILURE", errorDetails: reason }
+        )
+      );
+      await notify(
+        `${candidate.symbol}: auto-buy uncertain`,
+        `Verify manually on Kraken whether this order was placed. ${reason}`,
+        { urgent: true }
+      );
+      await sendExecutionWebhook(uncertainState.settings.executionWebhookUrl, {
+        symbol: candidate.symbol,
+        lotLabel: null,
+        result: "UNCERTAIN",
+        mode: "AUTO_BUY",
+        reason,
+        entryPrice: candidate.row.currentApiPrice,
+        currentPrice: candidate.row.currentApiPrice,
+        currentReturnPct: null,
+        details: [],
+        timestamp: Date.now(),
+      });
+    }
+  } finally {
+    autoBuyInFlight = false;
+  }
 }
 
 async function processLiveAutoClose(initialState: RuntimeState): Promise<void> {
@@ -1449,6 +1892,7 @@ async function processLiveAutoClose(initialState: RuntimeState): Promise<void> {
               fingerprint: candidate.fingerprint,
               executionResult: "SUCCESS",
               errorDetails: verification.details.join("; "),
+              realizedPnlUsd: candidate.latest?.netPnl ?? null,
             }
           )
         );
@@ -1590,6 +2034,8 @@ async function processScanResult(
     lastContentScriptResponseAt: now,
     lastCandidateRowCount: scan.candidateRowCount,
     lastRowDiscoveryMethod: scan.rowDiscoveryMethod,
+    accountEquityUsd: scan.accountEquityUsd ?? s.accountEquityUsd,
+    accountEquityUpdatedAt: scan.accountEquityUsd !== null ? now : s.accountEquityUpdatedAt,
   }));
   if (pendingManualPositionRefresh) {
     pendingManualPositionRefresh = false;
@@ -1632,6 +2078,9 @@ async function processScanResult(
   }
   if (!options.skipLiveAutoClose) await processLiveAutoClose(next);
   if (!options.skipMarketRefresh) await refreshMarketData({ automatic: false });
+  // Runs after refreshMarketData so signalStates/marketData for watchlist
+  // symbols are freshly computed this same cycle before deciding to buy.
+  if (!options.skipLiveAutoClose) await processAutopilotBuys(await getState());
 }
 
 function nextMarketRefreshAt(settings: RuntimeState["settings"], now: number): number {
@@ -1658,6 +2107,7 @@ async function refreshMarketData(options: {
     symbols,
     previous: state.marketData,
     preservePreviousOnError: true,
+    accountEquityUsd: state.accountEquityUsd,
   });
   const refreshedSymbols = symbols ?? Object.keys(marketData);
   const failed = refreshedSymbols
@@ -1695,41 +2145,77 @@ async function refreshMarketData(options: {
   }
 
   if (next.settings.watchlistCoins.length > 0) {
-    const updates = await evaluateWatchlistBuySignals(next.settings, next.watchlistSignals);
+    const activePositionSymbols = new Set(
+      Object.values(next.positions)
+        .filter((p) => p.status === "ACTIVE")
+        .map((p) => p.symbol)
+    );
+    const updates = await evaluateWatchlistBuySignals(
+      next.settings,
+      next.watchlistSignals,
+      activePositionSymbols
+    );
     const withSignals = await updateState((s) => ({
       ...s,
       watchlistSignals: {
         ...s.watchlistSignals,
         ...Object.fromEntries(updates.map((u) => [u.symbol, u.state])),
       },
+      signalStates: {
+        ...s.signalStates,
+        ...Object.fromEntries(
+          updates.map((u) => [u.symbol, { tier: u.tier, reason: u.tierReason, updatedAt: now }])
+        ),
+      },
     }));
     for (const update of updates) {
-      if (!update.newlyConfirmed) continue;
-      await appendAuditEntry(
-        makeAuditEntry(withSignals, "BUY_SIGNAL_DETECTED", `${update.symbol} golden cross confirmed.`, {
-          symbol: update.symbol,
-          currentPrice: update.currentPrice,
-          smaFast: update.smaFast,
-          smaSlow: update.smaSlow,
-          closeCounter: update.state.consecutiveClosesAboveSmaFast,
-        })
-      );
-      await notify(
-        `BUY SIGNAL: ${update.symbol}`,
-        "Golden cross confirmed. This is informational only — place a manual order if you agree."
-      );
-      await sendBuySignalWebhook(
-        withSignals.settings.executionWebhookUrl,
-        {
-          symbol: update.symbol,
-          currentPrice: update.currentPrice,
-          smaFast: update.smaFast,
-          smaSlow: update.smaSlow,
-          consecutiveClosesAboveSmaFast: update.state.consecutiveClosesAboveSmaFast,
-          timestamp: Date.now(),
-        },
-        withSignals.settings.executionEmailAddress
-      );
+      const previousTier = next.signalStates[update.symbol]?.tier ?? null;
+      if (update.newlyConfirmed) {
+        await appendAuditEntry(
+          makeAuditEntry(withSignals, "BUY_SIGNAL_DETECTED", `${update.symbol} golden cross confirmed.`, {
+            symbol: update.symbol,
+            currentPrice: update.currentPrice,
+            smaFast: update.smaFast,
+            smaSlow: update.smaSlow,
+            closeCounter: update.state.consecutiveClosesAboveSmaFast,
+          })
+        );
+        if (withSignals.operatingMode === "CRUISE") {
+          await notify(
+            `BUY SIGNAL: ${update.symbol}`,
+            "Golden cross confirmed. This is informational only — place a manual order if you agree."
+          );
+          await sendBuySignalWebhook(
+            withSignals.settings.executionWebhookUrl,
+            {
+              symbol: update.symbol,
+              currentPrice: update.currentPrice,
+              smaFast: update.smaFast,
+              smaSlow: update.smaSlow,
+              consecutiveClosesAboveSmaFast: update.state.consecutiveClosesAboveSmaFast,
+              timestamp: Date.now(),
+            },
+            withSignals.settings.executionEmailAddress
+          );
+        }
+      } else if (isNewSignalEscalation(previousTier, update.tier) && update.tier !== "HOLD") {
+        await appendAuditEntry(
+          makeAuditEntry(
+            withSignals,
+            "SIGNAL_TIER_CHANGED",
+            `${update.symbol}: ${previousTier ?? "HOLD"} -> ${update.tier} (${update.tierReason})`,
+            { symbol: update.symbol }
+          )
+        );
+        if (withSignals.operatingMode === "CRUISE") {
+          await notify(`${update.symbol}: ${update.tier}`, update.tierReason);
+          await sendSignalTierWebhook(
+            withSignals.settings.executionWebhookUrl,
+            { symbol: update.symbol, tier: update.tier, reason: update.tierReason, timestamp: Date.now() },
+            withSignals.settings.executionEmailAddress
+          );
+        }
+      }
     }
     await broadcastState(withSignals);
   } else {
@@ -1766,6 +2252,9 @@ async function handleMessage(
       break;
     case "ARM_AUTO_CLOSE":
       await handleArmAutoClose(message.durationHours, message.live);
+      break;
+    case "SET_OPERATING_MODE":
+      await setOperatingMode(message.mode);
       break;
     case "START_MONITORING_WITH_LIVE_AUTO_CLOSE": {
       const result = await handleStartMonitoringWithLiveAutoClose(message.durationHours);
@@ -1976,6 +2465,7 @@ async function handleConfirmCloseDialog(
               fingerprint: message.fingerprint,
               executionResult: "SUCCESS",
               errorDetails: verification.details.join("; "),
+              realizedPnlUsd: manualCandidate?.latest?.netPnl ?? null,
             }
           )
         );

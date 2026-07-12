@@ -9,6 +9,7 @@ import { resolvePublicMarket } from "../api/symbols";
 import { DEV_WATCHLIST_SYMBOLS } from "../shared/constants";
 import type { MarketDataRow, Settings, TrackedPosition } from "../shared/types";
 import { validateCandles } from "../shared/validation";
+import { computeSuggestedNewBuyUsd } from "../strategy/position-sizing";
 import { computeSmaSeries } from "../strategy/sma";
 import { determineTrend } from "../strategy/exit-strategy";
 
@@ -36,6 +37,9 @@ function emptyRow(
     lastUpdatedAt: now,
     apiStatus: "ERROR",
     errorMessage,
+    suggestedBuyUsd: null,
+    suggestedBuyUnits: null,
+    atOrAboveSizeCap: false,
   };
 }
 
@@ -47,6 +51,7 @@ export async function buildMarketDataTable(
     symbols?: string[];
     previous?: Record<string, MarketDataRow>;
     preservePreviousOnError?: boolean;
+    accountEquityUsd?: number | null;
   } = {}
 ): Promise<Record<string, MarketDataRow>> {
   const detectedSymbols = new Set(
@@ -54,6 +59,14 @@ export async function buildMarketDataTable(
       .filter((p) => p.status === "ACTIVE")
       .map((p) => p.symbol)
   );
+  const holdingValueBySymbol = new Map<string, number>();
+  for (const pos of Object.values(positions)) {
+    if (pos.status !== "ACTIVE") continue;
+    holdingValueBySymbol.set(
+      pos.symbol,
+      (holdingValueBySymbol.get(pos.symbol) ?? 0) + (pos.latest?.valueUsd ?? pos.openingValueUsd)
+    );
+  }
   const allSymbols = new Set(
     options.symbols ?? [...detectedSymbols, ...settings.watchlistCoins, ...DEV_WATCHLIST_SYMBOLS]
   );
@@ -89,6 +102,12 @@ export async function buildMarketDataTable(
       });
       const smaSeries = computeSmaSeries(candles, settings.fastSma, settings.slowSma);
       const latest = smaSeries[smaSeries.length - 1] ?? null;
+      const sizing = computeSuggestedNewBuyUsd({
+        accountEquityUsd: options.accountEquityUsd ?? null,
+        currentHoldingValueUsd: holdingValueBySymbol.get(symbol) ?? 0,
+        currentPrice: apiPrice,
+        capFraction: settings.positionSizeCapPct / 100,
+      });
 
       table[symbol] = {
         symbol,
@@ -109,6 +128,9 @@ export async function buildMarketDataTable(
         lastUpdatedAt: now,
         apiStatus: validation.ok ? "OK" : "STALE",
         errorMessage: validation.ok ? null : validation.errors.join("; "),
+        suggestedBuyUsd: sizing.suggestedBuyUsd,
+        suggestedBuyUnits: sizing.suggestedBuyUnits,
+        atOrAboveSizeCap: sizing.atOrAboveCap,
       };
     } catch (err) {
       const message = err instanceof MarketDataError ? err.message : String(err);

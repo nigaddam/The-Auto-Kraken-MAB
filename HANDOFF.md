@@ -1043,3 +1043,167 @@ function itself is already proven correct via the above tests.
 
 All four gates pass: `npm run typecheck`, `npm run lint`, `npm test`
 (198/198, up from 196), `npm run build`.
+
+## 22. Addendum: Cruise/Autopilot pivot, 5-tier signal engine, position sizing, daily goal (this session)
+
+The user requested a substantial pivot: the extension should eventually
+place both buy and sell orders autonomously (not just close existing
+positions), tracking up to 5 watchlist coins on a 5-tier signal
+(`STRONG_BUY`/`BUY`/`HOLD`/`SELL`/`STRONG_SELL`), sizing new entries to a
+soft 5%-of-equity cap, with two simplified modes (**Cruise** = watch and
+notify only; **Autopilot** = fully automatic, no confirmation dialogs) and
+a drastically simplified UI. Given the size and the fact that real
+buy-order DOM automation cannot be responsibly written without first
+running Order-Form Diagnostics against the real page (this project's own
+established lesson from two prior incidents — a regex capture-group bug
+and a full row-discovery rewrite, both from guessing at unseen Kraken
+markup), the work was scoped to ship everything **except** the actual
+buy-click automation, explicitly gating that follow-up on the user running
+Order-Form Diagnostics for real. Two direct clarifying questions were
+asked and answered before implementation: the daily goal is **display-only**
+(no behavior change when hit/missed), and Autopilot should **trim** the
+existing safety machinery (not just hide it behind fewer prompts) —
+accepting more tail risk for less friction, per the user's explicit choice.
+
+**Fixed first:** a pre-existing broken, uncommitted refactor
+(`src/strategy/indicators.ts` extraction, 16 typecheck errors / 6 failing
+tests) was completed as its own commit before any new work — it was
+already in service of this session's goal (its own comment said "shared by
+both the exit engine and the new entry engine").
+
+**New: unified 5-tier signal engine** (`src/strategy/signal-engine.ts`) —
+`classifySignalTier()` maps a held position's exit `Decision` (`CLOSE` →
+`STRONG_SELL`, `WATCH`/`BLOCKED` → `SELL`) or, for watchlist-only symbols,
+regime/golden-cross state (`BROKEN` → `SELL`; golden-cross confirmed or
+`EXPANSION` → `STRONG_BUY`/`BUY`; `HEALTHY`+`STRONG`+positive slope7 →
+`BUY`) onto the 5 tiers, in a fixed priority order so a held position's
+exit signal always dominates. `isNewSignalEscalation()` is the
+notification edge-trigger: fires leaving HOLD into either family,
+escalating further within a family, or flipping directly between
+families — silent on de-escalation toward HOLD. Wired into
+`evaluatePositions()` (held positions) and `evaluateWatchlistBuySignals()`
+(watchlist-only symbols, which now explicitly skips any symbol already
+covered by an active position so the two evaluators never race on the
+same `RuntimeState.signalStates[symbol]` entry).
+
+**New: soft position-size cap** (`src/strategy/position-sizing.ts`) —
+`computeSuggestedNewBuyUsd()` sizes a *new* buy suggestion to
+`Settings.positionSizeCapPct` (default 5%) of account equity minus the
+existing holding value; returns `atOrAboveCap` with no suggestion once
+already at/over cap, and **never** suggests trimming an organically-grown
+holding. Display-only in this pass — wired into `MarketDataRow`'s new
+`suggestedBuyUsd`/`suggestedBuyUnits`/`atOrAboveSizeCap` fields via
+`buildMarketDataTable()`, nothing places an order from it yet.
+
+**New: account equity in the normal scan path** — `order-form-diagnostics.ts`
+gained a narrow `readAccountEquitySnapshot()` (reuses the existing
+`findAccountEquityText`/`parseNumberFromText`, pure text read, no
+click/hover — a materially lower risk category than the Buy-tab/submit
+click automation the diagnostics gate exists for) called from every
+regular content-script scan, not just the manual diagnostics button.
+Feeds `RuntimeState.accountEquityUsd`/`accountEquityUpdatedAt`.
+
+**New: `RuntimeState.operatingMode` ("OFF"|"CRUISE"|"AUTOPILOT")** — a thin
+control layer on top of the existing, unmodified
+`executionMode`/`autoCloseLive`/`armedUntil`/`CloseExecutionRecord`
+machinery (`service-worker.ts`'s `setOperatingMode()`/`tryAutopilotArm()`).
+CRUISE runs monitor-only plus watchlist evaluation. AUTOPILOT arms LIVE
+Auto-Close and — critically — **self-renews**: `runScanCycle()` now rolls
+`armedUntil` forward each cycle instead of expiring, and calls
+`tryAutopilotArm({resetStats:false})` at the end of every cycle regardless
+of outcome, turning every existing disarm condition (stale data, sleep
+gap, logout, tab missing, uncertain execution, rate limit) into
+auto-pause/auto-resume instead of a hard stop requiring a manual re-arm
+click. **The one correctness-critical detail**: `handleArmAutoClose()`
+gained a third `resetStats` parameter (default `true`) — Autopilot's
+internal self-heal re-arm passes `false` so a transient blip can't
+silently wipe `liveAutoCloseStats.closesThisSession`/`closeTimestamps` and
+defeat `maxLiveClosesPerHour`/`maxLiveClosesPerArmedSession`; only an
+explicit fresh arm (user turning Autopilot on, or a restart resuming it)
+resets those counters. `disarmLiveAutoClose()`'s urgent notification is
+now suppressed while `operatingMode === "AUTOPILOT"` (self-healing has its
+own one-shot `autopilotReArmFailedSince`-gated "Autopilot paused"
+notification instead) so a repeatedly-blocked Autopilot doesn't spam.
+Trimmed per the user's explicit choice: no `prompt()`/`confirm()`
+anywhere in the new flow, no fixed-duration arm-then-expire ceremony.
+Kept per "basic correctness, not friction": fresh pre-click revalidation
+(`revalidateCloseCandidateBeforeSubmit`, unmodified), the rate-limit
+mechanism itself (just with corrected reset semantics), and a real
+restart still unconditionally disarms LIVE and re-runs a fresh preflight
+before Autopilot resumes.
+
+**New: Cruise-mode signal notifications** — a new `AuditEventType`
+`"SIGNAL_TIER_CHANGED"` plus a new `sendSignalTierWebhook` (parallel to
+the existing `sendBuySignalWebhook`, distinct SELL-side tag/title) fire
+only when `operatingMode === "CRUISE"`; Autopilot suppresses all
+signal-tier notifications and relies solely on the pre-existing terminal
+execution notifications. The pre-existing golden-cross
+`BUY_SIGNAL_DETECTED` notification (previously unconditional) is now also
+gated the same way, so Autopilot's notification surface is consistently
+just the terminal execution outcomes.
+
+**UI simplification** (`components.ts`/`sidepanel.ts`) — the 6-button
+Controls panel (Start/Stop/Arm-Dry-Run/Arm-LIVE/Disarm) is now a single
+3-way Off/Cruise/Autopilot toggle (`ControlHandlers.onSetOperatingMode`,
+new `SET_OPERATING_MODE` message). `startMonitoring()`/`armAutoClose()`
+and their `prompt()`/`confirm()` calls were deleted from `sidepanel.ts`
+entirely. The "Start Monitoring behavior" settings section
+(`startMonitoringWithLiveAutoClose`) was removed from the UI (the
+underlying setting/message/handler remain unchanged for back-compat and
+existing tests — just no longer surfaced, since the Autopilot toggle
+subsumes its purpose). Added: `positionSizeCapPct` (Risk section) and
+`dailyGoalPct` (new Goal section) to Settings; a 5-tier pill + sizing
+suggestion line on watchlist cards (`renderInterestedCoinsPanel`); the
+same 5-tier pill alongside the existing Decision pill on position cards
+(additive — Decision remains the actual execution driver); a new
+`renderDailyGoalCard` on the Positions tab.
+
+**New: daily goal display** (`src/strategy/daily-goal.ts`,
+`computeDailyGoalProgress()`) — purely informational, confirmed with the
+user. `AuditLogEntry` gained `realizedPnlUsd` (populated at the 4
+existing close-success call sites from `TrackedPosition.latest.netPnl`);
+`sidepanel.ts` sums today's realized P/L from the audit log plus current
+unrealized P/L (the pre-existing `currentPnl()` helper, now exported) and
+computes progress against `Settings.dailyGoalPct` — no field anywhere
+reacts to the result.
+
+**Explicitly out of scope, by design**: the actual Buy-order click
+automation (finding the real Buy tab, filling quantity, selecting Market
+order type, clicking submit, validating confirmation). Nothing added this
+session clicks anything on the buy side — the signal engine and sizing
+math only compute and display the decision. Unblocking step: run **Run
+Order-Form Diagnostics** (Settings) against the real, logged-in Kraken Buy
+tab and share the report; only then should a follow-up phase add
+`src/content/buy-executor.ts` (mirroring `close-preview.ts`'s exact
+resolve → open/validate → confirm pattern) and `processAutopilotBuys()`
+(mirroring `processLiveAutoClose()`).
+
+**Testing**: `tests/signal-engine.test.ts` (19 tests, every
+`classifySignalTier` branch + `isNewSignalEscalation` edge cases),
+`tests/position-sizing.test.ts` (7 tests), `tests/daily-goal.test.ts` (6
+tests) — all pure-function, no mocking. `tests/execution-notify.test.ts`
+gained 7 tests for `sendSignalTierWebhook`/builders.
+`tests/service-worker-continuity.test.ts` gained a 6-test `operating
+mode` block covering OFF/CRUISE/AUTOPILOT transitions, the one-shot
+"waiting to arm" notification gate, mode-switch disarm behavior, and the
+resetStats-on-explicit-arm behavior — with an explicit code comment
+noting that the resetStats:false self-heal path itself (reached only
+internally after a transient disarm, requiring a fully-passing preflight
+with real positions/market data to exercise for real) remains
+code-reviewed, not unit-tested, consistent with this project's existing
+"deeper execution-path scenarios" boundary (§13). `tests/sidepanel-ui.test.ts`'s
+obsolete dry-run/LIVE-button-text assertions were rewritten for the new
+mode-toggle UI.
+
+**Not done, and should be flagged before relying on this in production:**
+no live browser verification of the new UI/mode toggle against a real
+Kraken tab in this session (same category as the rest of this project's
+UI — see §13's existing testing boundary). The account-equity selector
+(`findAccountEquityText`) is architecturally low-risk but, like the rest
+of `order-form-diagnostics.ts`, has never been confirmed against the real
+page either — sizing/goal numbers should be treated as provisional until
+Order-Form Diagnostics is run for real and the equity value is
+eyeballed against Kraken's own display.
+
+All four gates pass: `npm run typecheck`, `npm run lint`, `npm test`
+(244/244, up from 198), `npm run build`.

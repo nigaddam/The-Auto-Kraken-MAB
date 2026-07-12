@@ -7,7 +7,21 @@ export type MonitoringStatus = "STOPPED" | "RUNNING";
  * autoCloseLive distinguishing final execution from logging-only mode. */
 export type ExecutionMode = "MONITOR_ONLY" | "PREVIEW" | "ARMED_AUTO_CLOSE";
 
+/** The user-facing simplification layer on top of ExecutionMode/autoCloseLive.
+ * OFF = monitoring stopped. CRUISE = monitoring running, watches existing
+ * positions and the watchlist, notifies on signal changes, never clicks
+ * anything. AUTOPILOT = monitoring running, LIVE auto-close armed
+ * (self-renewing, no manual re-arm ceremony) — the sell side is fully
+ * automatic today; the buy side is display-only until real DOM evidence for
+ * Kraken's Buy form exists (see OrderFormDiagnosticsReport). */
+export type OperatingMode = "OFF" | "CRUISE" | "AUTOPILOT";
+
 export type Decision = "HOLD" | "PROTECT" | "WATCH" | "CLOSE" | "BLOCKED" | "ERROR" | "CLOSED";
+
+/** A 5-tier signal classification shared by watchlist coins (no open
+ * position) and existing tracked positions (derived from their exit
+ * Decision) — see strategy/signal-engine.ts. */
+export type SignalTier = "STRONG_BUY" | "BUY" | "HOLD" | "SELL" | "STRONG_SELL";
 
 export type TrendStrength = "STRONG" | "WEAK" | "UNKNOWN";
 
@@ -221,6 +235,14 @@ export interface Settings {
    * never auto-bought; this only sends a notification so the user can
    * place a manual order themselves. */
   watchlistCoins: string[];
+  /** Soft cap, as a percent of total account equity, used only to size a
+   * *new* buy suggestion (strategy/position-sizing.ts). Never force-trims an
+   * existing holding that has organically grown past this — it only stops
+   * suggesting further buys into that symbol. */
+  positionSizeCapPct: number;
+  /** Purely a progress display (strategy/daily-goal.ts) — informational
+   * only, confirmed with the user. Nothing reacts to hitting or missing it. */
+  dailyGoalPct: number;
 }
 
 export type AuditEventType =
@@ -254,7 +276,11 @@ export type AuditEventType =
   | "MONITOR_RECOVERED"
   | "EXECUTION_INTERRUPTED_BY_RESTART"
   | "TEST_NOTIFICATION"
-  | "BUY_SIGNAL_DETECTED";
+  | "BUY_SIGNAL_DETECTED"
+  | "SIGNAL_TIER_CHANGED"
+  | "AUTO_BUY_SUCCEEDED"
+  | "AUTO_BUY_BLOCKED"
+  | "AUTO_BUY_UNCERTAIN";
 
 export interface LiveAutoClosePreflightResult {
   allowed: boolean;
@@ -312,6 +338,11 @@ export interface AuditLogEntry {
   reason: string;
   executionResult: "SUCCESS" | "FAILURE" | "BLOCKED" | null;
   errorDetails: string | null;
+  /** Realized P/L in USD, populated only at a close-success call site from
+   * TrackedPosition.latest.netPnl at the moment of closing. Null for every
+   * other event type — used solely for the daily-goal display's realized
+   * half (strategy/daily-goal.ts), never for execution logic. */
+  realizedPnlUsd: number | null;
 }
 
 export interface RuntimeState {
@@ -370,6 +401,40 @@ export interface RuntimeState {
    * so the "consecutive closes above SMA7" counter and the
    * already-fired-this-episode flag survive service-worker restarts. */
   watchlistSignals: Record<string, BuySignalState>;
+  /** User-facing simplified mode; drives executionMode/autoCloseLive/armedUntil
+   * underneath without changing their shape. See OperatingMode's doc comment. */
+  operatingMode: OperatingMode;
+  /** Read from the Kraken page's own account-equity display on every regular
+   * scan (content/order-form-diagnostics.ts's readAccountEquitySnapshot).
+   * Null until a scan successfully parses it. Used only for position-sizing
+   * and daily-goal display math — never for execution/safety gating. */
+  accountEquityUsd: number | null;
+  accountEquityUpdatedAt: number | null;
+  /** Unified 5-tier signal per symbol — watchlist coins (from
+   * evaluateWatchlistBuySignals) and symbols with an ACTIVE tracked position
+   * (from evaluatePositions, derived from that position's exit Decision)
+   * both write into this same record, never both for the same symbol in the
+   * same cycle. */
+  signalStates: Record<string, SignalStateEntry>;
+  /** One-shot notify gate (same pattern as monitorStalledSince): set the
+   * first cycle Autopilot fails to (re-)arm LIVE, cleared the moment it
+   * succeeds, so the "waiting to arm" notification doesn't repeat every
+   * cycle while still blocked. */
+  autopilotReArmFailedSince: number | null;
+  /** Per-symbol timestamp of the last Autopilot buy *attempt* (any outcome,
+   * not just success) — a cooldown floor so the same symbol can't be
+   * re-attempted every cycle while position reconciliation catches up
+   * (once a buy succeeds and the position is detected, the symbol stops
+   * being a watchlist candidate at all — this is purely a safety net for
+   * the detection-lag window immediately after). */
+  autoBuyIntents: Record<string, number>;
+}
+
+/** One symbol's current position in the 5-tier signal scale. */
+export interface SignalStateEntry {
+  tier: SignalTier;
+  reason: string;
+  updatedAt: number;
 }
 
 /** Tracks golden-cross (SMA7 crosses above SMA30) progress for one
@@ -407,6 +472,13 @@ export interface MarketDataRow {
   lastUpdatedAt: number | null;
   apiStatus: "OK" | "STALE" | "ERROR";
   errorMessage: string | null;
+  /** Soft-cap sizing suggestion (strategy/position-sizing.ts) — display-only
+   * in this pass, nothing places an order from these fields yet. Null
+   * whenever account equity is unavailable or the symbol is already at or
+   * above the cap. */
+  suggestedBuyUsd: number | null;
+  suggestedBuyUnits: number | null;
+  atOrAboveSizeCap: boolean;
 }
 
 /** Read-only DOM diagnostics report shape. Populated in content/diagnostics.ts;
@@ -464,6 +536,38 @@ export interface CloseModalValidation {
   actionEvidence: string | null;
   quantityEvidence: string | null;
   finalControlText: string | null;
+}
+
+/** Validation of Kraken's post-submit BUY confirmation modal ("Market long
+ * 0.001 BTC ... Cancel | Confirm"), mirroring CloseModalValidation's
+ * evidence-based shape. Confirmed against a real modal on 2026-07-12 —
+ * unlike the close modal, the final button's own text is just "Confirm"
+ * (not symbol-specific), so finalButtonMatched relies on exact-text
+ * matching scoped to this one already-symbol/quantity-matched modal. */
+export interface BuyModalValidation {
+  modalFound: boolean;
+  symbolMatched: boolean;
+  actionMatched: boolean;
+  quantityMatched: boolean;
+  finalButtonMatched: boolean;
+  conflictingActionFound: boolean;
+  confidence: "HIGH" | "LOW";
+  ready: boolean;
+  blockedReason: string | null;
+  modalTextExcerpt: string;
+  quantityEvidence: string | null;
+  finalControlText: string | null;
+}
+
+/** Result of attempting to fill and open (or confirm) a real Kraken BUY
+ * order. `quantitySet` is the exact quantity this extension wrote into the
+ * input (re-read back from the DOM after setting it, never assumed). */
+export interface BuyOrderReport {
+  symbol: string;
+  ready: boolean;
+  blockedReason: string | null;
+  quantitySet: number | null;
+  modalValidation?: BuyModalValidation | null;
 }
 
 export interface RowDiagnostics {

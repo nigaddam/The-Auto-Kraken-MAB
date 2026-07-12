@@ -45,7 +45,7 @@ export function findOrderEntryPanel(root: ParentNode): Element | null {
   return heading ? (heading.parentElement ?? heading) : null;
 }
 
-function findTabCandidates(panel: Element, label: "buy" | "sell" | "market" | "limit"): Element[] {
+export function findTabCandidates(panel: Element, label: "buy" | "sell" | "market" | "limit"): Element[] {
   const candidates = Array.from(panel.querySelectorAll<Element>('[role="tab"], button, [role="button"]'));
   return candidates.filter((el) => {
     const name = el.getAttribute("aria-label") ?? el.getAttribute("title") ?? textOf(el);
@@ -53,7 +53,7 @@ function findTabCandidates(panel: Element, label: "buy" | "sell" | "market" | "l
   });
 }
 
-function tabSelectedState(tab: Element | null): boolean | "UNKNOWN" {
+export function tabSelectedState(tab: Element | null): boolean | "UNKNOWN" {
   if (!tab) return "UNKNOWN";
   const ariaSelected = tab.getAttribute("aria-selected");
   if (ariaSelected === "true") return true;
@@ -82,17 +82,42 @@ function buildControlInfo(candidates: Element[]): OrderFormControlInfo | null {
   };
 }
 
-function findQuantityInput(panel: Element): HTMLInputElement | null {
-  const inputs = Array.from(panel.querySelectorAll<HTMLInputElement>("input"));
-  const match = inputs.find((el) => {
+/** Real Kraken evidence (2026-07-12 diagnostics run) shows the Quantity
+ * input has no aria-label/placeholder/name/data-testid at all — it's a bare
+ * <input> visually associated with a "Quantity" text label only, not
+ * programmatically. Falls back to a label-anchored search: find an element
+ * whose own text is (near-)exactly a label keyword, then look for the
+ * nearest <input> within a few ancestor levels — same "label:value text
+ * fallback" convention already used by findLabeledText for the position
+ * parser, adapted here to locate an element instead of a text value. */
+function findLabeledInput(panel: Element, labelKeywords: RegExp[]): HTMLInputElement | null {
+  const attrMatch = Array.from(panel.querySelectorAll<HTMLInputElement>("input")).find((el) => {
     const label =
       el.getAttribute("aria-label") ??
       el.getAttribute("placeholder") ??
       el.getAttribute("name") ??
       el.getAttribute("data-testid");
-    return matchesAnyKeyword(label, [/quantity/i, /amount/i, /size/i]);
+    return matchesAnyKeyword(label, labelKeywords);
   });
-  return match ?? null;
+  if (attrMatch) return attrMatch;
+
+  const labelElements = Array.from(panel.querySelectorAll<Element>("*")).filter((el) => {
+    const text = el.children.length === 0 ? textOf(el) : "";
+    return text.length > 0 && text.length < 40 && matchesAnyKeyword(text, labelKeywords);
+  });
+  for (const label of labelElements) {
+    let container: Element | null = label;
+    for (let depth = 0; depth < 4 && container; depth++) {
+      const input = container.querySelector<HTMLInputElement>("input");
+      if (input) return input;
+      container = container.parentElement;
+    }
+  }
+  return null;
+}
+
+export function findQuantityInput(panel: Element): HTMLInputElement | null {
+  return findLabeledInput(panel, [/quantity/i, /amount/i, /size/i]);
 }
 
 function findOrderTypeState(panel: Element): { isMarket: boolean | "UNKNOWN"; isLimit: boolean | "UNKNOWN" } {
@@ -102,9 +127,16 @@ function findOrderTypeState(panel: Element): { isMarket: boolean | "UNKNOWN"; is
   };
 }
 
-function findSubmitControlCandidates(panel: Element): Element[] {
+/** Real Kraken evidence (2026-07-12 diagnostics run) shows the Buy/Sell tab
+ * buttons themselves have accessible name "Buy"/"Sell" — which the keyword
+ * regex below also matches, so without excluding them the Buy tab and the
+ * true final submit button ("Long (buy) JTO") both come back as candidates,
+ * falsely flagging as ambiguous. `excluding` is always the already-found
+ * tab/order-type control elements, filtered out by reference. */
+export function findSubmitControlCandidates(panel: Element, excluding: Element[]): Element[] {
   const candidates = Array.from(panel.querySelectorAll<Element>('button, [role="button"]'));
   return candidates.filter((el) => {
+    if (excluding.includes(el)) return false;
     const name = el.getAttribute("aria-label") ?? el.getAttribute("title") ?? textOf(el);
     return /\b(buy|place\s*order|submit|open\s*long)\b/i.test(name);
   });
@@ -126,15 +158,35 @@ export function findAccountEquityText(root: ParentNode): string | null {
   return findLabeledText(scoped, [/total\s*equity/i, /account\s*equity/i, /^equity$/i]);
 }
 
+/** Narrow, always-on equity read for the normal scan path — reuses the same
+ * text search as the full Order-Form Diagnostics report above, but doesn't
+ * touch the Buy-tab/quantity/submit-control search that report also does.
+ * Pure text read, no click/hover — a much lower risk category than the
+ * click automation the diagnostics gate exists for, so it's safe to run on
+ * every scan rather than only behind the manual diagnostics button. */
+export function readAccountEquitySnapshot(root: ParentNode): number | null {
+  const equityText = findAccountEquityText(root);
+  return equityText ? parseNumberFromText(equityText) : null;
+}
+
 export function runOrderFormDiagnostics(root: ParentNode, url: string): OrderFormDiagnosticsReport {
   const panel = findOrderEntryPanel(root);
 
   const buyTabCandidates = panel ? findTabCandidates(panel, "buy") : [];
   const sellTabCandidates = panel ? findTabCandidates(panel, "sell") : [];
+  const marketTabCandidates = panel ? findTabCandidates(panel, "market") : [];
+  const limitTabCandidates = panel ? findTabCandidates(panel, "limit") : [];
 
   const quantityInput = panel ? findQuantityInput(panel) : null;
   const orderType = panel ? findOrderTypeState(panel) : { isMarket: "UNKNOWN" as const, isLimit: "UNKNOWN" as const };
-  const submitCandidates = panel ? findSubmitControlCandidates(panel) : [];
+  const submitCandidates = panel
+    ? findSubmitControlCandidates(panel, [
+        ...buyTabCandidates,
+        ...sellTabCandidates,
+        ...marketTabCandidates,
+        ...limitTabCandidates,
+      ])
+    : [];
 
   const leverageText = panel
     ? findLabeledText(panel, [/leverage/i])

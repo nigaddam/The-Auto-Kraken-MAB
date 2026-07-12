@@ -3,7 +3,7 @@ import {
   renderAppHeader,
   renderConnectionPanel,
   renderControlsPanel,
-  renderMarketDataPanel,
+  renderInterestedCoinsPanel,
   renderLogsSection,
   renderPositionsSection,
   renderSettingsPanel,
@@ -11,12 +11,38 @@ import {
   renderTabBar,
 } from "../src/sidepanel/components";
 import { freshRuntimeState } from "../src/storage/migrations";
-import type { AuditLogEntry, MarketDataRow, RuntimeState } from "../src/shared/types";
+import type { AuditLogEntry, MarketDataRow, RuntimeState, TrackedPosition } from "../src/shared/types";
+
+function makeActivePosition(symbol: string): TrackedPosition {
+  return {
+    fingerprint: `${symbol}-fp`,
+    symbol,
+    side: "LONG",
+    openingPrice: 1,
+    openingValueUsd: 100,
+    firstObservedAt: Date.now(),
+    lastSeenAt: Date.now(),
+    status: "ACTIVE",
+    latest: null,
+    latestApiPrice: null,
+    latestApiPriceAt: null,
+    highestObservedPrice: 1,
+    peakReturnPct: 0,
+    profitFloorPct: null,
+    smaFast: null,
+    smaSlow: null,
+    trend: "UNKNOWN",
+    consecutiveClosesBelowSmaFast: 0,
+    lastProcessedCandleTs: null,
+    decision: "HOLD",
+    reason: "No exit rule active.",
+    autoCloseDisabledReason: null,
+  };
+}
 
 const NOOP = () => undefined;
 const HANDLERS = {
-  onStart: NOOP,
-  onStop: NOOP,
+  onSetOperatingMode: NOOP,
   onRefresh: NOOP,
   onTestNotification: NOOP,
   onExportLogs: NOOP,
@@ -41,6 +67,9 @@ function makeMarketDataRow(symbol: string): MarketDataRow {
     lastUpdatedAt: Date.now(),
     apiStatus: "OK",
     errorMessage: null,
+    suggestedBuyUsd: null,
+    suggestedBuyUnits: null,
+    atOrAboveSizeCap: false,
   };
 }
 
@@ -57,7 +86,6 @@ describe("side panel: no API key UI anywhere", () => {
       renderConnectionPanel(state, now),
       renderControlsPanel(state, HANDLERS),
       renderStatusPanel(state, now),
-      renderMarketDataPanel(state, now),
       renderPositionsSection(state, now)
     );
 
@@ -66,46 +94,53 @@ describe("side panel: no API key UI anywhere", () => {
   });
 });
 
-describe("side panel: Auto-Close arming is explicit dry-run", () => {
-  it("labels Start Monitoring as monitor-only and exposes dry-run arming separately", () => {
+describe("side panel: simplified Off/Cruise/Autopilot mode control", () => {
+  it("shows all three mode buttons and describes OFF as fully stopped", () => {
+    const state: RuntimeState = { ...freshRuntimeState(), operatingMode: "OFF" };
+    const panel = renderControlsPanel(state, HANDLERS);
+    const buttonLabels = Array.from(panel.querySelectorAll("button")).map((b) => b.textContent);
+    expect(buttonLabels).toContain("Off");
+    expect(buttonLabels).toContain("Cruise");
+    expect(buttonLabels).toContain("Autopilot");
+    expect(panel.textContent ?? "").toMatch(/stopped/i);
+  });
+
+  it("describes CRUISE as watch-and-notify only, no orders placed", () => {
     const state: RuntimeState = {
       ...freshRuntimeState(),
       monitoringStatus: "RUNNING",
+      operatingMode: "CRUISE",
     };
     const panel = renderControlsPanel(state, HANDLERS);
     const text = panel.textContent ?? "";
-    expect(text).toMatch(/Arm Auto-Close Dry Run/i);
-    expect(text).toMatch(/Arm LIVE Auto-Close/i);
-    expect(text).toMatch(/monitor-only/i);
-    expect(text).toMatch(/will not execute trades/i);
+    expect(text).toMatch(/notifications/i);
+    expect(text).toMatch(/no orders are placed/i);
   });
 
-  it("shows armed dry-run status without implying live execution", () => {
+  it("describes AUTOPILOT as armed once executionMode/autoCloseLive confirm it", () => {
     const state: RuntimeState = {
       ...freshRuntimeState(),
       monitoringStatus: "RUNNING",
-      executionMode: "ARMED_AUTO_CLOSE",
-      armedUntil: Date.now() + 60_000,
-    };
-    const panel = renderControlsPanel(state, HANDLERS);
-    const text = panel.textContent ?? "";
-    expect(text).toMatch(/Auto-Close Armed/i);
-    expect(text).toMatch(/dry-run mode only/i);
-    expect(text).toMatch(/does not click Kraken final confirmation/i);
-  });
-
-  it("shows live armed status separately from dry-run", () => {
-    const state: RuntimeState = {
-      ...freshRuntimeState(),
-      monitoringStatus: "RUNNING",
+      operatingMode: "AUTOPILOT",
       executionMode: "ARMED_AUTO_CLOSE",
       autoCloseLive: true,
       armedUntil: Date.now() + 60_000,
     };
     const panel = renderControlsPanel(state, HANDLERS);
     const text = panel.textContent ?? "";
-    expect(text).toMatch(/LIVE Auto-Close is armed/i);
-    expect(text).toMatch(/may close Kraken positions automatically/i);
+    expect(text).toMatch(/Autopilot is armed/i);
+    expect(text).toMatch(/no confirmation prompts/i);
+  });
+
+  it("describes AUTOPILOT as not yet armed when executionMode hasn't caught up", () => {
+    const state: RuntimeState = {
+      ...freshRuntimeState(),
+      monitoringStatus: "RUNNING",
+      operatingMode: "AUTOPILOT",
+    };
+    const panel = renderControlsPanel(state, HANDLERS);
+    const text = panel.textContent ?? "";
+    expect(text).toMatch(/not yet armed/i);
   });
 });
 
@@ -173,16 +208,72 @@ describe("side panel tabs", () => {
 });
 
 describe("side panel tab content", () => {
-  it("Market tab renders JTO and XPL watchlist cards without positions", () => {
+  it("Market tab (Interested Kraken Coins) renders cards for manually-added watchlist symbols", () => {
     const state: RuntimeState = {
       ...freshRuntimeState(),
       marketData: { XPL: makeMarketDataRow("XPL"), JTO: makeMarketDataRow("JTO") },
+      settings: { ...freshRuntimeState().settings, watchlistCoins: ["XPL", "JTO"] },
     };
-    const panel = renderMarketDataPanel(state, Date.now());
+    const panel = renderInterestedCoinsPanel(state, Date.now());
     const text = panel.textContent ?? "";
     expect(text).toMatch(/JTO/);
     expect(text).toMatch(/XPL/);
-    expect(text).toMatch(/Watchlist/i);
+  });
+
+  it("shows symbols with an open position as auto-tracked without consuming a manual slot", () => {
+    const state: RuntimeState = {
+      ...freshRuntimeState(),
+      positions: { "XPL-fp": makeActivePosition("XPL") },
+      settings: { ...freshRuntimeState().settings, watchlistCoins: ["SOL"] },
+    };
+    const panel = renderInterestedCoinsPanel(state, Date.now());
+    const text = panel.textContent ?? "";
+    expect(text).toMatch(/Auto-tracked/i);
+    expect(text).toMatch(/XPL/);
+    expect(text).toMatch(/Tracking 2 of 5 slots/i);
+  });
+
+  it("lets the user add and remove manual watchlist symbols from the Market tab", () => {
+    let latest: string[] | null = null;
+    const state: RuntimeState = {
+      ...freshRuntimeState(),
+      settings: { ...freshRuntimeState().settings, watchlistCoins: ["SOL"] },
+    };
+    const panel = renderInterestedCoinsPanel(state, Date.now(), {
+      onUpdateWatchlist: (symbols) => {
+        latest = symbols;
+      },
+    });
+
+    const input = panel.querySelector<HTMLInputElement>(".watchlist-add-row input");
+    const addBtn = panel.querySelector<HTMLButtonElement>(".watchlist-add-row button");
+    expect(input).not.toBeNull();
+    expect(addBtn).not.toBeNull();
+    input!.value = "avax";
+    addBtn!.click();
+    expect(latest).toEqual(["SOL", "AVAX"]);
+
+    const removeBtn = panel.querySelector<HTMLButtonElement>(".chip-remove");
+    expect(removeBtn).not.toBeNull();
+    removeBtn!.click();
+    expect(latest).toEqual([]);
+  });
+
+  it("disables adding once all 5 slots are used (positions + manual entries)", () => {
+    const state: RuntimeState = {
+      ...freshRuntimeState(),
+      positions: {
+        "A-fp": makeActivePosition("AAA"),
+        "B-fp": makeActivePosition("BBB"),
+      },
+      settings: { ...freshRuntimeState().settings, watchlistCoins: ["CCC", "DDD", "EEE"] },
+    };
+    const panel = renderInterestedCoinsPanel(state, Date.now(), { onUpdateWatchlist: () => {} });
+    const input = panel.querySelector<HTMLInputElement>(".watchlist-add-row input");
+    const addBtn = panel.querySelector<HTMLButtonElement>(".watchlist-add-row button");
+    expect(input?.disabled).toBe(true);
+    expect(addBtn?.disabled).toBe(true);
+    expect(panel.textContent ?? "").toMatch(/Tracking 5 of 5 slots/i);
   });
 
   it("Notifications tab humanizes audit entries", () => {
@@ -204,6 +295,7 @@ describe("side panel tab content", () => {
       reason: "Monitoring started.",
       executionResult: "SUCCESS",
       errorDetails: null,
+      realizedPnlUsd: null,
     };
     const panel = renderLogsSection([entry], HANDLERS);
     expect(panel.textContent ?? "").toMatch(/Monitoring started/);

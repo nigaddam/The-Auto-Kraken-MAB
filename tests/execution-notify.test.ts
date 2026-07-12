@@ -4,12 +4,16 @@ import {
   buildBuySignalTitle,
   buildExecutionNotificationBody,
   buildExecutionNotificationTitle,
+  buildSignalTierBody,
+  buildSignalTierTitle,
   isPlausibleEmailAddress,
   isSupportedExecutionWebhookUrl,
   sendBuySignalWebhook,
   sendExecutionWebhook,
+  sendSignalTierWebhook,
   type BuySignalNotificationDetails,
   type ExecutionNotificationDetails,
+  type SignalTierNotificationDetails,
 } from "../src/background/execution-notify";
 
 function makeDetails(
@@ -316,6 +320,107 @@ describe("sendBuySignalWebhook", () => {
     try {
       await expect(
         sendBuySignalWebhook("https://ntfy.sh/my-topic", makeBuySignalDetails())
+      ).resolves.toBeUndefined();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+function makeSignalTierDetails(
+  overrides: Partial<SignalTierNotificationDetails> = {}
+): SignalTierNotificationDetails {
+  return {
+    symbol: "SOL",
+    tier: "STRONG_SELL",
+    reason: "Exit engine confirmed CLOSE on the open position.",
+    timestamp: 1_700_000_000_000,
+    ...overrides,
+  };
+}
+
+describe("signal tier notification builders", () => {
+  it("builds a BUY-side title for STRONG_BUY/BUY", () => {
+    expect(buildSignalTierTitle(makeSignalTierDetails({ tier: "BUY" }))).toBe("BUY SIGNAL: SOL (BUY)");
+    expect(buildSignalTierTitle(makeSignalTierDetails({ tier: "STRONG_BUY" }))).toBe(
+      "BUY SIGNAL: SOL (STRONG_BUY)"
+    );
+  });
+
+  it("builds a SELL-side title for SELL/STRONG_SELL", () => {
+    expect(buildSignalTierTitle(makeSignalTierDetails({ tier: "SELL" }))).toBe("SELL SIGNAL: SOL (SELL)");
+    expect(buildSignalTierTitle(makeSignalTierDetails({ tier: "STRONG_SELL" }))).toBe(
+      "SELL SIGNAL: SOL (STRONG_SELL)"
+    );
+  });
+
+  it("includes the reason and an informational-only disclaimer in the body", () => {
+    const body = buildSignalTierBody(makeSignalTierDetails());
+    expect(body).toMatch(/Exit engine confirmed CLOSE/);
+    expect(body).toMatch(/Informational only \(Cruise mode\)/);
+  });
+});
+
+describe("sendSignalTierWebhook", () => {
+  it("POSTs with distinct headers per direction and severity", async () => {
+    const calls: [unknown, RequestInit][] = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (...args: unknown[]) => {
+      calls.push(args as [unknown, RequestInit]);
+      return Promise.resolve(new Response());
+    };
+    try {
+      await sendSignalTierWebhook("https://ntfy.sh/my-topic", makeSignalTierDetails({ tier: "STRONG_SELL" }));
+      const [, init] = calls[0]!;
+      const headers = init.headers as Record<string, string>;
+      expect(headers.Title).toBe("SELL SIGNAL: SOL (STRONG_SELL)");
+      expect(headers.Priority).toBe("high");
+      expect(headers.Tags).toBe("chart_with_downwards_trend");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("uses default priority for non-strong tiers and the moneybag tag for BUY", async () => {
+    const calls: [unknown, RequestInit][] = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (...args: unknown[]) => {
+      calls.push(args as [unknown, RequestInit]);
+      return Promise.resolve(new Response());
+    };
+    try {
+      await sendSignalTierWebhook("https://ntfy.sh/my-topic", makeSignalTierDetails({ tier: "BUY" }));
+      const [, init] = calls[0]!;
+      const headers = init.headers as Record<string, string>;
+      expect(headers.Priority).toBe("default");
+      expect(headers.Tags).toBe("moneybag");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("does nothing when the URL is empty or unsupported", async () => {
+    const calls: unknown[] = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (...args: unknown[]) => {
+      calls.push(args);
+      return Promise.resolve(new Response());
+    };
+    try {
+      await sendSignalTierWebhook("", makeSignalTierDetails());
+      await sendSignalTierWebhook("https://example.com/hook", makeSignalTierDetails());
+      expect(calls.length).toBe(0);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("swallows fetch errors instead of throwing", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = () => Promise.reject(new Error("network down"));
+    try {
+      await expect(
+        sendSignalTierWebhook("https://ntfy.sh/my-topic", makeSignalTierDetails())
       ).resolves.toBeUndefined();
     } finally {
       globalThis.fetch = originalFetch;

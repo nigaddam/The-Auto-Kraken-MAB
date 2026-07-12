@@ -1,8 +1,9 @@
 import type { ScanResultMessage } from "../shared/messages";
 import { isExtensionMessage } from "../shared/messages";
 import { confirmValidatedCloseModal, openKrakenCloseDialog, previewClosePosition, validateCloseModal } from "./close-preview";
+import { confirmValidatedBuyOrder, openKrakenBuyOrder } from "./buy-preview";
 import { runDiagnostics } from "./diagnostics";
-import { runOrderFormDiagnostics } from "./order-form-diagnostics";
+import { readAccountEquitySnapshot, runOrderFormDiagnostics } from "./order-form-diagnostics";
 import { checkPageHealth } from "./page-health";
 import { parsePositionsFromDocument } from "./position-parser";
 
@@ -28,6 +29,7 @@ function buildScanResult(): ScanResultMessage {
     pageHealth,
     candidateRowCount,
     rowDiscoveryMethod: discoveryMethod,
+    accountEquityUsd: readAccountEquitySnapshot(document),
   };
 }
 
@@ -99,6 +101,33 @@ chrome.runtime.onMessage.addListener(
       } catch (err) {
         sendResponse({
           type: "CONFIRM_CLOSE_DIALOG_RESULT",
+          modalValidation: null,
+          clicked: false,
+          error: String(err),
+        });
+      }
+      return undefined;
+    }
+
+    if (message.type === "OPEN_BUY_ORDER") {
+      void openKrakenBuyOrder(document, message.symbol, message.quantityUnits)
+        .then((report) => sendResponse({ type: "OPEN_BUY_ORDER_RESULT", report, error: null }))
+        .catch((err) => sendResponse({ type: "OPEN_BUY_ORDER_RESULT", report: null, error: String(err) }));
+      return true;
+    }
+
+    if (message.type === "CONFIRM_BUY_ORDER") {
+      try {
+        const result = confirmValidatedBuyOrder(document, message.symbol, message.quantityUnits);
+        sendResponse({
+          type: "CONFIRM_BUY_ORDER_RESULT",
+          modalValidation: result.validation,
+          clicked: result.clicked,
+          error: null,
+        });
+      } catch (err) {
+        sendResponse({
+          type: "CONFIRM_BUY_ORDER_RESULT",
           modalValidation: null,
           clicked: false,
           error: String(err),

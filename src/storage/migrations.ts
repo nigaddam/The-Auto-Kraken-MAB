@@ -40,6 +40,12 @@ export function freshRuntimeState(): RuntimeState {
     monitorStalledSince: null,
     recentlyClosedByExtension: {},
     watchlistSignals: {},
+    operatingMode: "OFF",
+    accountEquityUsd: null,
+    accountEquityUpdatedAt: null,
+    signalStates: {},
+    autopilotReArmFailedSince: null,
+    autoBuyIntents: {},
   };
 }
 
@@ -77,5 +83,19 @@ export function migrateState(raw: unknown): RuntimeState {
     monitorStalledSince: state.monitorStalledSince ?? null,
     recentlyClosedByExtension: state.recentlyClosedByExtension ?? {},
     watchlistSignals: state.watchlistSignals ?? {},
+    // Derive a sane initial operatingMode from whatever was running before
+    // this field existed, rather than always resetting to OFF.
+    operatingMode:
+      state.operatingMode ??
+      (state.executionMode === "ARMED_AUTO_CLOSE" && state.autoCloseLive
+        ? "AUTOPILOT"
+        : state.monitoringStatus === "RUNNING"
+          ? "CRUISE"
+          : "OFF"),
+    accountEquityUsd: state.accountEquityUsd ?? null,
+    accountEquityUpdatedAt: state.accountEquityUpdatedAt ?? null,
+    signalStates: state.signalStates ?? {},
+    autopilotReArmFailedSince: state.autopilotReArmFailedSince ?? null,
+    autoBuyIntents: state.autoBuyIntents ?? {},
   };
 }

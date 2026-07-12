@@ -375,3 +375,139 @@ describe("monitoring loop continuity", () => {
     expect(response.preflightBlockers.length).toBeGreaterThan(0);
   });
 });
+
+/**
+ * Coverage note: getting Autopilot to actually complete a LIVE arm requires
+ * a full passing canArmLiveAutoClose preflight — at least one real ACTIVE
+ * position with a resolved symbol and healthy market data, which means
+ * mocking Kraken's public OHLC/Ticker/AssetPairs responses through a full
+ * strategy evaluation. That's the same larger harness explicitly flagged as
+ * out of scope in HANDOFF.md's "deeper execution-path scenarios... remain
+ * code-reviewed, not test-automated." These tests instead cover what's
+ * cheaply and deterministically testable with the existing zero-position
+ * mock: operating-mode state transitions, the one-shot "waiting to arm"
+ * notification gate (so a persistently-blocked Autopilot doesn't spam), and
+ * that switching away from AUTOPILOT disarms any armed LIVE state. The
+ * resetStats reset-on-explicit-arm behavior is covered directly against
+ * handleArmAutoClose's dry-run path (ARM_AUTO_CLOSE with live:false, which
+ * doesn't require the live preflight); the resetStats:false self-heal path
+ * itself (reached only internally via tryAutopilotArm after a transient
+ * disarm) is code-reviewed, not unit-tested, consistent with the above.
+ */
+describe("operating mode", () => {
+  let harness: ReturnType<typeof createChromeMock>;
+
+  beforeEach(async () => {
+    harness = createChromeMock();
+    vi.stubGlobal("chrome", harness.chromeMock);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => Promise.reject(new Error("network disabled in test")))
+    );
+    await importFreshServiceWorker();
+  });
+
+  afterEach(async () => {
+    if (vi.isFakeTimers()) await vi.runAllTimersAsync();
+    await flushMicrotasks(200);
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  it("OFF -> CRUISE starts monitoring in MONITOR_ONLY, never arms LIVE", async () => {
+    await harness.sendMessage({ type: "SET_OPERATING_MODE", mode: "CRUISE" });
+    const after = (await harness.sendMessage({ type: "GET_STATE" })) as {
+      state: { operatingMode: string; monitoringStatus: string; executionMode: string; autoCloseLive: boolean };
+    };
+    expect(after.state.operatingMode).toBe("CRUISE");
+    expect(after.state.monitoringStatus).toBe("RUNNING");
+    expect(after.state.executionMode).toBe("MONITOR_ONLY");
+    expect(after.state.autoCloseLive).toBe(false);
+  });
+
+  it("CRUISE -> AUTOPILOT starts monitoring and attempts to arm, notifying once when preflight blocks", async () => {
+    await harness.sendMessage({ type: "SET_OPERATING_MODE", mode: "AUTOPILOT" });
+    const after = (await harness.sendMessage({ type: "GET_STATE" })) as {
+      state: {
+        operatingMode: string;
+        monitoringStatus: string;
+        autoCloseLive: boolean;
+        autopilotReArmFailedSince: number | null;
+      };
+    };
+    expect(after.state.operatingMode).toBe("AUTOPILOT");
+    expect(after.state.monitoringStatus).toBe("RUNNING");
+    // Zero positions in this harness means canArmLiveAutoClose always
+    // blocks — Autopilot must not falsely claim to be armed.
+    expect(after.state.autoCloseLive).toBe(false);
+    expect(after.state.autopilotReArmFailedSince).not.toBeNull();
+    expect(harness.notifications.some((n) => /Autopilot paused/i.test(n.title))).toBe(true);
+  });
+
+  it("does not repeat the 'waiting to arm' notification every cycle while still blocked", async () => {
+    await harness.sendMessage({ type: "SET_OPERATING_MODE", mode: "AUTOPILOT" });
+    const firstCount = harness.notifications.filter((n) => /Autopilot paused/i.test(n.title)).length;
+    expect(firstCount).toBe(1);
+
+    await harness.fireAlarm("kraken-guard-poll");
+    await harness.fireAlarm("kraken-guard-poll");
+
+    const secondCount = harness.notifications.filter((n) => /Autopilot paused/i.test(n.title)).length;
+    expect(secondCount).toBe(1); // still just the one, despite multiple blocked cycles
+  });
+
+  it("AUTOPILOT -> OFF stops monitoring and clears operatingMode", async () => {
+    await harness.sendMessage({ type: "SET_OPERATING_MODE", mode: "AUTOPILOT" });
+    await harness.sendMessage({ type: "SET_OPERATING_MODE", mode: "OFF" });
+    const after = (await harness.sendMessage({ type: "GET_STATE" })) as {
+      state: { operatingMode: string; monitoringStatus: string };
+    };
+    expect(after.state.operatingMode).toBe("OFF");
+    expect(after.state.monitoringStatus).toBe("STOPPED");
+  });
+
+  it("switching from AUTOPILOT to CRUISE disarms any armed LIVE state", async () => {
+    await harness.sendMessage({ type: "START_MONITORING" });
+    const key = "kraken_guard_state";
+    const before = harness.storage[key] as {
+      operatingMode: string;
+      executionMode: string;
+      autoCloseLive: boolean;
+    };
+    // Directly seed an already-armed state, bypassing the real preflight —
+    // this test is only about the mode-switch disarm behavior, not arming.
+    before.operatingMode = "AUTOPILOT";
+    before.executionMode = "ARMED_AUTO_CLOSE";
+    before.autoCloseLive = true;
+
+    await harness.sendMessage({ type: "SET_OPERATING_MODE", mode: "CRUISE" });
+    const after = (await harness.sendMessage({ type: "GET_STATE" })) as {
+      state: { operatingMode: string; executionMode: string; autoCloseLive: boolean };
+    };
+    expect(after.state.operatingMode).toBe("CRUISE");
+    expect(after.state.executionMode).toBe("MONITOR_ONLY");
+    expect(after.state.autoCloseLive).toBe(false);
+  });
+
+  it("an explicit arm (resetStats default true) zeroes out prior session stats", async () => {
+    await harness.sendMessage({ type: "START_MONITORING" });
+    const key = "kraken_guard_state";
+    const before = harness.storage[key] as {
+      liveAutoCloseStats: { closesThisSession: number; closeTimestamps: number[] };
+    };
+    before.liveAutoCloseStats = {
+      closesThisSession: 3,
+      closeTimestamps: [Date.now() - 1000, Date.now() - 2000],
+    };
+
+    // Dry-run arm doesn't require the live preflight, so it's reachable
+    // deterministically in this zero-position harness.
+    await harness.sendMessage({ type: "ARM_AUTO_CLOSE", durationHours: 1, live: false });
+
+    const after = (await harness.sendMessage({ type: "GET_STATE" })) as {
+      state: { liveAutoCloseStats: { closesThisSession: number; closeTimestamps: number[] } };
+    };
+    expect(after.state.liveAutoCloseStats.closesThisSession).toBe(0);
+    expect(after.state.liveAutoCloseStats.closeTimestamps).toEqual([]);
+  });
+});

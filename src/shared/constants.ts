@@ -51,6 +51,8 @@ export const DEFAULT_SETTINGS: Settings = {
   executionWebhookUrl: "https://ntfy.sh/kraken-guard-nitgaddam-1992",
   executionEmailAddress: "",
   watchlistCoins: [],
+  positionSizeCapPct: 5,
+  dailyGoalPct: 0.25,
 };
 
 /** Hard cap on Settings.watchlistCoins — keeps the per-cycle public-API

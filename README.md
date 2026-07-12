@@ -151,16 +151,26 @@ Does not:
 
 ## Live-close safety model
 
-- **Start Monitoring** is monitor-only.
-- **Arm Auto-Close Dry Run** logs qualifying close intents but does not click
-  Kraken's final confirmation.
-- **Arm LIVE Auto-Close** requires a preflight pass, an explicit duration,
-  and a browser acknowledgment. LIVE mode disarms on dangerous runtime
-  conditions such as sleep gaps, logout, stale API data, parser degradation,
-  ambiguous close controls, modal-validation failure, or uncertain close
-  verification.
-- Manual close remains admin-confirmed: open the Kraken close dialog, verify
-  the side-panel summary, then click Confirm Close.
+The Controls panel is a single **Off / Cruise / Autopilot** mode toggle
+(replacing the older separate Start/Stop/Arm-Dry-Run/Arm-LIVE/Disarm
+buttons — see "Cruise and Autopilot mode" below):
+
+- **Off** — monitoring is stopped, nothing is tracked or watched.
+- **Cruise** — monitor-only. Watches existing positions and up to 5
+  watchlist coins, sends buy/sell notifications on signal changes, and
+  never clicks anything.
+- **Autopilot** — arms LIVE Auto-Close and keeps it armed continuously
+  (self-renewing; no fixed-duration re-arm ceremony, no `prompt()`/`confirm()`
+  dialogs). It still requires a real preflight pass before it will ever
+  click anything, and still auto-pauses (rather than silently continuing)
+  on dangerous runtime conditions such as sleep gaps, logout, stale API
+  data, parser degradation, ambiguous close controls, modal-validation
+  failure, or uncertain close verification — it just resumes on its own
+  next cycle once the condition clears, instead of requiring a manual
+  re-arm click. Rate limits (`maxLiveClosesPerHour` /
+  `maxLiveClosesPerArmedSession`) still apply.
+- Manual close remains admin-confirmed regardless of mode: open the Kraken
+  close dialog, verify the side-panel summary, then click Confirm Close.
 
 ## Installing from a clean Mac
 
@@ -180,8 +190,8 @@ Re-run `npm run build` (or `npm run watch` during development) and click the rel
 9. Open `https://pro.kraken.com/prop/...` and go to the Portfolio page.
 10. Log into Kraken **manually** — including any 2FA/passkey step. The extension never touches this.
 11. Click the extension's toolbar icon to open the **side panel** (it opens automatically on click; no separate menu needed).
-12. Click **Start Monitoring**. This only works if a Kraken Prop tab is already open.
-13. Read the position cards: entry/current/API price, value, P&L, current and peak return, SMA7/SMA30, trend, decision, and a plain-English reason.
+12. Click **Cruise** (or **Autopilot**, once you're comfortable with it) in Controls. This only works if a Kraken Prop tab is already open.
+13. Read the position cards: entry/current/API price, value, P&L, current and peak return, SMA7/SMA30, trend, decision, a 5-tier signal pill (STRONG_BUY/BUY/HOLD/SELL/STRONG_SELL), and a plain-English reason.
 14. Click **Test Notification** to confirm Chrome notifications work.
 15. Click **Export Logs** to download the sanitized audit log as JSON.
 
@@ -367,6 +377,41 @@ discovery. Watchlist rows are labeled **WATCHLIST**; a symbol backing a
 real detected position is labeled **DETECTED**. The watchlist has no
 effect on execution or the strategy engine — it only triggers a market
 data fetch for display.
+
+## Watchlist signal tiers, position sizing, and daily goal
+
+Settings → **Interested Kraken Coins** lets you track up to 5 symbols
+(e.g. `BTC`, `ETH`, `SOL`) that have no open position. The Market tab shows
+each one's 5-tier signal — `STRONG_BUY` / `BUY` / `HOLD` / `SELL` /
+`STRONG_SELL` — derived from the same regime/golden-cross logic as the
+exit engine (`src/strategy/signal-engine.ts`), plus a suggested new-buy
+size that keeps the symbol within **Settings → Risk → Position size cap**
+(default 5% of total account equity; a soft cap that only limits *new*
+buy suggestions — it never force-trims a holding that's organically grown
+past it). Existing tracked positions show the same 5-tier pill next to
+their Decision pill, derived from that position's own exit signal.
+
+**Cruise mode** sends a notification whenever a symbol's tier crosses into
+BUY/STRONG_BUY (an entry candidate) or SELL/STRONG_SELL (an existing
+position turning bearish) — informational only, no order is placed.
+**Autopilot** currently only acts on the sell side (closing existing
+positions via the LIVE Auto-Close pipeline above); it does not yet place
+buy orders — see the note below.
+
+**Buy-side execution is not implemented yet.** Automating a real Buy
+order requires knowing Kraken's actual Buy-tab/quantity-input/submit-button
+markup, which this extension has never inspected (unlike the Close
+dialog, which was calibrated against real DOM evidence before any click
+code was written — see "DOM Diagnostics" below). Settings has a **Run
+Order-Form Diagnostics** button that reads (never clicks) the Buy panel
+and your account-equity display; running it once against your real,
+logged-in Buy tab is the prerequisite for a future pass to add real
+buy-order automation.
+
+**Settings → Goal → Daily goal** (default 0.25% of account equity) is a
+pure progress display on the Positions tab — realized P/L from today's
+successful closes plus current unrealized P/L, shown against the goal.
+Nothing changes behavior when it's hit or missed.
 
 ## Testing
 

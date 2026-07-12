@@ -1,8 +1,11 @@
 import type {
+  BuyModalValidation,
+  BuyOrderReport,
   DiagnosticsReport,
   ExecutionMode,
   CloseModalValidation,
   LiveAutoClosePreflightResult,
+  OperatingMode,
   OrderFormDiagnosticsReport,
   PageHealthStatus,
   ParsedPositionData,
@@ -22,6 +25,11 @@ export interface ScanResultMessage {
   pageHealth: PageHealthStatus;
   candidateRowCount: number;
   rowDiscoveryMethod: RowDiscoveryMethod;
+  /** Parsed from the Kraken page's own account-equity display on every
+   * regular scan (a narrow, always-on text read — not the click-risk
+   * category the Order-Form Diagnostics gate is about). Null until parsed
+   * successfully at least once. */
+  accountEquityUsd: number | null;
 }
 
 /** Service worker -> content script: please scan now. */
@@ -52,6 +60,15 @@ export interface ArmAutoCloseMessage {
   type: "ARM_AUTO_CLOSE";
   durationHours: number;
   live: boolean;
+}
+
+/** The simplified Off/Cruise/Autopilot control the side panel now exposes
+ * instead of the separate Start/Stop/Arm-Dry-Run/Arm-LIVE/Disarm buttons.
+ * Drives executionMode/autoCloseLive/armedUntil underneath without
+ * changing their shape — see OperatingMode's doc comment in shared/types.ts. */
+export interface SetOperatingModeMessage {
+  type: "SET_OPERATING_MODE";
+  mode: OperatingMode;
 }
 
 /** One-click combined flow, gated behind Settings.startMonitoringWithLiveAutoClose.
@@ -199,6 +216,35 @@ export interface ConfirmCloseDialogResultMessage {
   error: string | null;
 }
 
+/** Fills the quantity, ensures Buy+Market are selected, clicks submit, and
+ * waits for/validates the resulting Kraken confirmation modal — mirrors
+ * OPEN_CLOSE_DIALOG's shape exactly. Never clicks the modal's own Confirm
+ * button; CONFIRM_BUY_ORDER is the separate, re-validated final step. */
+export interface OpenBuyOrderMessage {
+  type: "OPEN_BUY_ORDER";
+  symbol: string;
+  quantityUnits: number;
+}
+
+export interface OpenBuyOrderResultMessage {
+  type: "OPEN_BUY_ORDER_RESULT";
+  report: BuyOrderReport | null;
+  error: string | null;
+}
+
+export interface ConfirmBuyOrderMessage {
+  type: "CONFIRM_BUY_ORDER";
+  symbol: string;
+  quantityUnits: number;
+}
+
+export interface ConfirmBuyOrderResultMessage {
+  type: "CONFIRM_BUY_ORDER_RESULT";
+  modalValidation: BuyModalValidation | null;
+  clicked: boolean;
+  error: string | null;
+}
+
 export interface CloseModalStatusMessage {
   type: "CLOSE_MODAL_STATUS";
   symbol: string;
@@ -219,6 +265,7 @@ export type ExtensionMessage =
   | StartMonitoringMessage
   | StopMonitoringMessage
   | ArmAutoCloseMessage
+  | SetOperatingModeMessage
   | StartMonitoringWithLiveAutoCloseMessage
   | StartMonitoringWithLiveAutoCloseResultMessage
   | RunLivePreflightMessage
@@ -244,6 +291,10 @@ export type ExtensionMessage =
   | OpenCloseDialogResultMessage
   | ConfirmCloseDialogMessage
   | ConfirmCloseDialogResultMessage
+  | OpenBuyOrderMessage
+  | OpenBuyOrderResultMessage
+  | ConfirmBuyOrderMessage
+  | ConfirmBuyOrderResultMessage
   | CloseModalStatusMessage
   | CloseModalStatusResultMessage;
 

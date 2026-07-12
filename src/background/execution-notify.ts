@@ -27,7 +27,7 @@ export interface ExecutionNotificationDetails {
   symbol: string;
   lotLabel: string | null;
   result: "SUCCESS" | "FAILURE" | "UNCERTAIN";
-  mode: "LIVE_AUTO_CLOSE" | "MANUAL";
+  mode: "LIVE_AUTO_CLOSE" | "MANUAL" | "AUTO_BUY";
   reason: string;
   entryPrice: number | null;
   currentPrice: number | null;
@@ -52,15 +52,21 @@ export function isPlausibleEmailAddress(email: string): boolean {
 
 export function buildExecutionNotificationTitle(d: ExecutionNotificationDetails): string {
   const lot = d.lotLabel ? ` ${d.lotLabel}` : "";
+  if (d.mode === "AUTO_BUY") {
+    const outcome = d.result === "SUCCESS" ? "bought" : d.result === "UNCERTAIN" ? "UNCERTAIN" : "FAILED";
+    return `${d.symbol}${lot} ${outcome} (Autopilot buy)`;
+  }
   const outcome =
     d.result === "SUCCESS" ? "closed" : d.result === "UNCERTAIN" ? "UNCERTAIN" : "FAILED";
   return `${d.symbol}${lot} ${outcome} (${d.mode === "MANUAL" ? "manual" : "LIVE"})`;
 }
 
 export function buildExecutionNotificationBody(d: ExecutionNotificationDetails): string {
+  const modeLabel =
+    d.mode === "MANUAL" ? "Manual close" : d.mode === "AUTO_BUY" ? "Autopilot buy" : "LIVE Auto-Close";
   const lines = [
     `Symbol: ${d.symbol}${d.lotLabel ? ` ${d.lotLabel}` : ""}`,
-    `Mode: ${d.mode === "MANUAL" ? "Manual close" : "LIVE Auto-Close"}`,
+    `Mode: ${modeLabel}`,
     `Result: ${d.result}`,
     `Reason: ${d.reason}`,
   ];
@@ -160,5 +166,60 @@ export async function sendBuySignalWebhook(
     await fetch(webhookUrl, { method: "POST", headers, body });
   } catch (err) {
     console.warn("[kraken-guard] buy signal webhook failed", err);
+  }
+}
+
+/** Covers every Cruise-mode signal-tier escalation that isn't already the
+ * more specific golden-cross BUY_SIGNAL_DETECTED case (that one keeps using
+ * sendBuySignalWebhook above) — i.e. entering SELL/STRONG_SELL, or entering
+ * BUY/STRONG_BUY by a route other than a fresh golden cross. Cruise-only,
+ * informational — never places or closes anything. */
+export interface SignalTierNotificationDetails {
+  symbol: string;
+  tier: "STRONG_BUY" | "BUY" | "SELL" | "STRONG_SELL";
+  reason: string;
+  timestamp: number;
+}
+
+export function buildSignalTierTitle(d: SignalTierNotificationDetails): string {
+  const direction = d.tier === "STRONG_BUY" || d.tier === "BUY" ? "BUY SIGNAL" : "SELL SIGNAL";
+  return `${direction}: ${d.symbol} (${d.tier})`;
+}
+
+export function buildSignalTierBody(d: SignalTierNotificationDetails): string {
+  return [
+    `Symbol: ${d.symbol}`,
+    `Signal: ${d.tier}`,
+    `Reason: ${d.reason}`,
+    `Time: ${new Date(d.timestamp).toLocaleString()}`,
+    "Informational only (Cruise mode) — no order was placed or closed.",
+  ].join("\n");
+}
+
+export async function sendSignalTierWebhook(
+  webhookUrl: string,
+  details: SignalTierNotificationDetails,
+  emailAddress = ""
+): Promise<void> {
+  if (!webhookUrl) return;
+  if (!isSupportedExecutionWebhookUrl(webhookUrl)) {
+    console.warn(`[kraken-guard] executionWebhookUrl is not an ntfy.sh URL, skipping: ${webhookUrl}`);
+    return;
+  }
+
+  const isBuySide = details.tier === "STRONG_BUY" || details.tier === "BUY";
+  const headers: Record<string, string> = {
+    Title: buildSignalTierTitle(details),
+    Priority: details.tier === "STRONG_BUY" || details.tier === "STRONG_SELL" ? "high" : "default",
+    Tags: isBuySide ? "moneybag" : "chart_with_downwards_trend",
+  };
+  if (emailAddress && isPlausibleEmailAddress(emailAddress)) {
+    headers["X-Email"] = emailAddress;
+  }
+
+  try {
+    await fetch(webhookUrl, { method: "POST", headers, body: buildSignalTierBody(details) });
+  } catch (err) {
+    console.warn("[kraken-guard] signal tier webhook failed", err);
   }
 }

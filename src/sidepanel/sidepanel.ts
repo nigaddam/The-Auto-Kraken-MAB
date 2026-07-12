@@ -2,27 +2,29 @@ import { isExtensionMessage } from "../shared/messages";
 import type { GetStateMessage } from "../shared/messages";
 import type {
   DiagnosticsReport,
+  OperatingMode,
   OrderFormDiagnosticsReport,
   RuntimeState,
   Settings,
   TrackedPosition,
 } from "../shared/types";
 import { getAuditLog } from "../storage/audit-log";
+import { computeDailyGoalProgress } from "../strategy/daily-goal";
 import {
   renderAppHeader,
   renderControlsPanel,
+  renderDailyGoalCard,
   renderDiagnosticsSection,
   renderInterestedCoinsPanel,
   renderLogsSection,
-  renderMarketDataPanel,
   renderOrderFormDiagnosticsSection,
   renderPositionsSection,
   renderSettingsPanel,
   renderStatusPanel,
   renderTabBar,
   renderTabPanel,
+  currentPnl,
   type ManualCloseUiState,
-  type MarketRefreshUiState,
   type PreviewCloseUiState,
   type TabId,
 } from "./components";
@@ -40,7 +42,6 @@ let latestDiagnosticsError: string | null = null;
 let latestOrderFormDiagnosticsReport: OrderFormDiagnosticsReport | null = null;
 let latestOrderFormDiagnosticsError: string | null = null;
 let selectedTab: TabId = "positions";
-let marketRefreshState: MarketRefreshUiState = { refreshing: null, message: null, error: null };
 let previewCloseState: PreviewCloseUiState = { message: null, error: null };
 let manualCloseState: ManualCloseUiState = { pending: null };
 
@@ -69,10 +70,7 @@ async function render(): Promise<void> {
 
   const logs = await getAuditLog();
   const controls = {
-    onStart: () => void startMonitoring(),
-    onStop: () => void sendAndRefresh({ type: "STOP_MONITORING" }),
-    onArmAutoClose: (live: boolean) => void armAutoClose(live),
-    onDisarmAutoClose: () => void sendAndRefresh({ type: "DISARM_AUTO_CLOSE" }),
+    onSetOperatingMode: (mode: OperatingMode) => void setOperatingMode(mode),
     onRefresh: () => void sendAndRefresh({ type: "REFRESH_POSITIONS" }),
     onTestNotification: () => void sendAndRefresh({ type: "TEST_NOTIFICATION" }),
     onExportLogs: () => void exportLogs(),
@@ -89,15 +87,31 @@ async function render(): Promise<void> {
     onContinueManualClose: () => void continueManualClose(),
     onConfirmManualClose: () => void confirmManualClose(),
     onClearLogs: () => void clearLogsWithConfirmation(),
-    onRefreshMarketData: (symbol?: string) => void refreshMarketData(symbol),
   };
 
   app.append(renderAppHeader(state), renderTabBar(selectedTab, (tab) => void selectTab(tab)));
 
   if (selectedTab === "positions") {
+    const dayStartMs = new Date().setHours(0, 0, 0, 0);
+    const realizedPnlTodayUsd = logs
+      .filter(
+        (entry) =>
+          (entry.eventType === "AUTO_CLOSE_SUCCEEDED" ||
+            entry.eventType === "MANUAL_POSITION_CLOSE_SUCCEEDED") &&
+          entry.timestamp >= dayStartMs &&
+          entry.realizedPnlUsd !== null
+      )
+      .reduce((sum, entry) => sum + (entry.realizedPnlUsd ?? 0), 0);
+    const goal = computeDailyGoalProgress({
+      accountEquityUsd: state.accountEquityUsd,
+      dailyGoalPct: state.settings.dailyGoalPct,
+      realizedPnlTodayUsd,
+      unrealizedPnlUsd: currentPnl(state),
+    });
     app.append(
       renderTabPanel("positions", [
         renderPositionsSection(state, now, controls, previewCloseState, manualCloseState),
+        renderDailyGoalCard({ ...goal, dailyGoalPct: state.settings.dailyGoalPct }),
         renderStatusPanel(state, now),
         renderControlsPanel(state, controls),
       ])
@@ -105,8 +119,9 @@ async function render(): Promise<void> {
   } else if (selectedTab === "market") {
     app.append(
       renderTabPanel("market", [
-        renderInterestedCoinsPanel(state, now),
-        renderMarketDataPanel(state, now, controls, marketRefreshState),
+        renderInterestedCoinsPanel(state, now, {
+          onUpdateWatchlist: (symbols) => void updateWatchlist(symbols),
+        }),
       ])
     );
   } else if (selectedTab === "notifications") {
@@ -130,7 +145,9 @@ async function render(): Promise<void> {
     }
     if (latestOrderFormDiagnosticsReport || latestOrderFormDiagnosticsError) {
       children.push(
-        renderOrderFormDiagnosticsSection(latestOrderFormDiagnosticsReport, latestOrderFormDiagnosticsError)
+        renderOrderFormDiagnosticsSection(latestOrderFormDiagnosticsReport, latestOrderFormDiagnosticsError, () =>
+          void copyOrderFormDiagnosticsToClipboard()
+        )
       );
     }
     app.append(renderTabPanel("settings", children));
@@ -142,95 +159,11 @@ async function sendAndRefresh(message: { type: string; [key: string]: unknown })
   await requestState();
 }
 
-/** Routes Start Monitoring through the combined one-click flow when
- * Settings.startMonitoringWithLiveAutoClose is on; otherwise behaves
- * exactly like the plain two-step Start Monitoring always has. LIVE
- * preflight cannot run before monitoring has produced a fresh scan, so —
- * unlike armAutoClose(true) — confirmation here is collected up front,
- * before monitoring even starts; the service worker runs the real
- * preflight afterward and only arms if it passes. */
-async function startMonitoring(): Promise<void> {
-  if (!latestState) return;
-  if (!latestState.settings.startMonitoringWithLiveAutoClose) {
-    await sendAndRefresh({ type: "START_MONITORING" });
-    return;
-  }
-
-  let durationHours = latestState.settings.autoCloseDurationHours;
-  const entered = prompt(
-    "LIVE Auto-Close duration in hours (monitoring starts first; LIVE only arms if preflight passes)",
-    String(durationHours)
-  );
-  if (entered === null) return;
-  const parsed = Number(entered);
-  if (!Number.isFinite(parsed) || parsed <= 0) {
-    previewCloseState = { message: null, error: "LIVE Auto-Close duration must be a positive number of hours." };
-    await render();
-    return;
-  }
-  durationHours = parsed;
-  if (
-    !confirm(
-      "Start Monitoring will also try to arm LIVE Auto-Close. I understand that qualifying live positions may be closed automatically."
-    )
-  ) {
-    return;
-  }
-
-  const response: unknown = await chrome.runtime.sendMessage({
-    type: "START_MONITORING_WITH_LIVE_AUTO_CLOSE",
-    durationHours,
-  });
-  if (isExtensionMessage(response) && response.type === "START_MONITORING_WITH_LIVE_AUTO_CLOSE_RESULT") {
-    if (!response.monitoringStarted) {
-      previewCloseState = { message: null, error: "Monitoring could not start (Kraken tab not found)." };
-    } else if (response.liveArmed) {
-      previewCloseState = { message: "Monitoring started and LIVE Auto-Close armed.", error: null };
-    } else {
-      previewCloseState = {
-        message: "Monitoring started in Monitor Only mode.",
-        error: `LIVE Auto-Close was not armed: ${response.preflightBlockers.join(" ")}`,
-      };
-    }
-  }
-  await requestState();
-}
-
-async function armAutoClose(live: boolean): Promise<void> {
-  if (!latestState) return;
-  let durationHours = latestState.settings.autoCloseDurationHours;
-  if (live) {
-    const preflightResponse: unknown = await chrome.runtime.sendMessage({ type: "RUN_LIVE_PREFLIGHT" });
-    await requestState();
-    if (
-      !isExtensionMessage(preflightResponse) ||
-      preflightResponse.type !== "RUN_LIVE_PREFLIGHT_RESULT" ||
-      !preflightResponse.result.allowed
-    ) {
-      return;
-    }
-    const entered = prompt("LIVE Auto-Close duration in hours", String(durationHours));
-    if (entered === null) return;
-    const parsed = Number(entered);
-    if (!Number.isFinite(parsed) || parsed <= 0) {
-      previewCloseState = { message: null, error: "LIVE Auto-Close duration must be a positive number of hours." };
-      await render();
-      return;
-    }
-    durationHours = parsed;
-    if (
-      !confirm(
-        "I understand that qualifying live positions may be closed automatically."
-      )
-    ) {
-      return;
-    }
-  }
-  await sendAndRefresh({
-    type: "ARM_AUTO_CLOSE",
-    durationHours,
-    live,
-  });
+/** The single Off/Cruise/Autopilot toggle — no prompt()/confirm() ceremony.
+ * Autopilot's preflight blockers (if any) surface via the existing
+ * non-modal preflight card on the Positions tab instead of a dialog. */
+async function setOperatingMode(mode: OperatingMode): Promise<void> {
+  await sendAndRefresh({ type: "SET_OPERATING_MODE", mode });
 }
 
 async function requestState(): Promise<void> {
@@ -260,35 +193,35 @@ async function clearLogsWithConfirmation(): Promise<void> {
   await sendAndRefresh({ type: "CLEAR_LOGS" });
 }
 
-async function refreshMarketData(symbol?: string): Promise<void> {
-  marketRefreshState = {
-    refreshing: symbol ? { kind: "symbol", symbol } : { kind: "all" },
-    message: null,
-    error: null,
-  };
-  await render();
-  const response: unknown = await chrome.runtime.sendMessage({
-    type: "REFRESH_MARKET_DATA",
-    symbol,
-  });
-  if (isExtensionMessage(response) && response.type === "REFRESH_MARKET_DATA_RESULT") {
-    marketRefreshState = {
-      refreshing: null,
-      message: response.ok ? "Updated just now" : null,
-      error: response.error,
-    };
-  } else {
-    marketRefreshState = {
-      refreshing: null,
-      message: null,
-      error: "Unexpected market refresh response.",
-    };
-  }
+/** No panel displays market-refresh progress/errors anymore (the Market
+ * Data table was removed — Positions already shows equivalent per-symbol
+ * data for anything you hold), so this just fires the refresh and lets the
+ * subsequent state broadcast update the UI. */
+async function refreshMarketData(): Promise<void> {
+  await chrome.runtime.sendMessage({ type: "REFRESH_MARKET_DATA" });
   await requestState();
 }
 
 async function saveSettings(settings: Settings): Promise<void> {
   await sendAndRefresh({ type: "UPDATE_SETTINGS", settings });
+  // Same reasoning as updateWatchlist: a newly-added watchlist symbol
+  // shouldn't have to wait for the next scheduled refresh to show data.
+  await refreshMarketData();
+}
+
+/** Symbols with an open position are never included here — they're tracked
+ * automatically and don't consume a manual watchlist slot (see
+ * renderInterestedCoinsPanel's slot accounting). Immediately triggers a
+ * market-data refresh afterward so a newly-added symbol shows real data
+ * right away instead of sitting at "not available yet" until the next
+ * scheduled refresh (up to marketRefreshMinutes later). */
+async function updateWatchlist(symbols: string[]): Promise<void> {
+  if (!latestState) return;
+  await sendAndRefresh({
+    type: "UPDATE_SETTINGS",
+    settings: { ...latestState.settings, watchlistCoins: symbols },
+  });
+  await refreshMarketData();
 }
 
 async function resetSettings(): Promise<void> {
@@ -447,6 +380,16 @@ async function confirmManualClose(): Promise<void> {
 async function copyDiagnosticsToClipboard(): Promise<void> {
   if (!latestDiagnosticsReport) return;
   const json = JSON.stringify(latestDiagnosticsReport, null, 2);
+  try {
+    await navigator.clipboard.writeText(json);
+  } catch (err) {
+    console.warn("[kraken-guard] clipboard write failed", err);
+  }
+}
+
+async function copyOrderFormDiagnosticsToClipboard(): Promise<void> {
+  if (!latestOrderFormDiagnosticsReport) return;
+  const json = JSON.stringify(latestOrderFormDiagnosticsReport, null, 2);
   try {
     await navigator.clipboard.writeText(json);
   } catch (err) {

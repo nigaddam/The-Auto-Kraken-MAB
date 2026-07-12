@@ -38,7 +38,7 @@ function compactText(el: Element | Document): string {
   return (el.textContent ?? "").replace(/\s+/g, " ").trim();
 }
 
-function sleep(ms: number): Promise<void> {
+export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
@@ -53,7 +53,7 @@ function sleep(ms: number): Promise<void> {
  * implementations unmount the underlying positions table while their own
  * dialog is open, so a dangling dialog can make the next position scan
  * wrongly read zero positions until the dialog is dismissed. */
-function dismissOpenModal(): void {
+export function dismissOpenModal(): void {
   const escEvent = new KeyboardEvent("keydown", {
     key: "Escape",
     code: "Escape",

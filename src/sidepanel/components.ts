@@ -3,10 +3,12 @@ import type {
   Decision,
   DiagnosticsReport,
   MarketDataRow,
+  OperatingMode,
   OrderFormDiagnosticsReport,
   RuntimeState,
   SessionState,
   Settings,
+  SignalTier,
   TrackedPosition,
 } from "../shared/types";
 import { DEV_WATCHLIST_SYMBOLS, MAX_WATCHLIST_COINS } from "../shared/constants";
@@ -129,6 +131,21 @@ function decisionTone(decision: Decision): "ok" | "warn" | "bad" | "neutral" {
   }
 }
 
+function signalTierTone(tier: SignalTier): "ok" | "warn" | "bad" | "neutral" {
+  switch (tier) {
+    case "STRONG_BUY":
+      return "ok";
+    case "BUY":
+      return "ok";
+    case "HOLD":
+      return "neutral";
+    case "SELL":
+      return "warn";
+    case "STRONG_SELL":
+      return "bad";
+  }
+}
+
 function statusTone(state: RuntimeState): "ok" | "warn" | "bad" | "neutral" {
   const active = Object.values(state.positions).filter((p) => p.status === "ACTIVE");
   if (active.some((p) => p.decision === "CLOSE" || p.decision === "ERROR")) return "bad";
@@ -161,7 +178,7 @@ function uniqueMarkets(positions: TrackedPosition[]): string[] {
   return [...new Set(positions.map((p) => p.symbol))].sort();
 }
 
-function currentPnl(state: RuntimeState): number | null {
+export function currentPnl(state: RuntimeState): number | null {
   const values = activePositions(state)
     .map((p) => p.latest?.netPnl ?? p.latest?.upnl ?? null)
     .filter((v): v is number => v !== null);
@@ -341,10 +358,7 @@ export function renderConnectionPanel(state: RuntimeState, now: number): HTMLEle
 }
 
 export interface ControlHandlers {
-  onStart: () => void;
-  onStop: () => void;
-  onArmAutoClose?: (live: boolean) => void;
-  onDisarmAutoClose?: () => void;
+  onSetOperatingMode: (mode: OperatingMode) => void;
   onRefresh: () => void;
   onTestNotification: () => void;
   onExportLogs: () => void;
@@ -354,14 +368,7 @@ export interface ControlHandlers {
   onCancelManualClose?: () => void;
   onContinueManualClose?: () => void;
   onConfirmManualClose?: () => void;
-  onRefreshMarketData?: (symbol?: string) => void;
   onClearLogs?: () => void;
-}
-
-export interface MarketRefreshUiState {
-  refreshing: { kind: "all" } | { kind: "symbol"; symbol: string } | null;
-  message: string | null;
-  error: string | null;
 }
 
 export interface PreviewCloseUiState {
@@ -383,52 +390,72 @@ export interface ManualCloseUiState {
   } | null;
 }
 
+const MODE_OPTIONS: { mode: OperatingMode; label: string }[] = [
+  { mode: "OFF", label: "Off" },
+  { mode: "CRUISE", label: "Cruise" },
+  { mode: "AUTOPILOT", label: "Autopilot" },
+];
+
 export function renderControlsPanel(state: RuntimeState, handlers: ControlHandlers): HTMLElement {
   const panel = el("section", "panel stack controls-panel");
   panel.append(el("h2", undefined, "Controls"));
 
-  const isRunning = state.monitoringStatus === "RUNNING";
-  const controls = el("div", "controls");
-
-  const startBtn = el("button", "primary", "Start Monitoring");
-  startBtn.disabled = isRunning;
-  startBtn.addEventListener("click", handlers.onStart);
-
-  const stopBtn = el("button", undefined, "Stop Monitoring");
-  stopBtn.disabled = !isRunning;
-  stopBtn.addEventListener("click", handlers.onStop);
-
+  const controls = el("div", "controls mode-controls");
+  for (const { mode, label } of MODE_OPTIONS) {
+    const btn = el("button", mode === state.operatingMode ? "primary" : undefined, label);
+    btn.setAttribute("aria-pressed", String(mode === state.operatingMode));
+    btn.addEventListener("click", () => handlers.onSetOperatingMode(mode));
+    controls.append(btn);
+  }
   const refreshBtn = el("button", undefined, "Refresh Positions");
   refreshBtn.addEventListener("click", handlers.onRefresh);
-
-  const autoCloseArmed = state.executionMode === "ARMED_AUTO_CLOSE" && state.armedUntil !== null;
-  const armBtn = el(
-    "button",
-    undefined,
-    autoCloseArmed ? "Auto-Close Armed" : "Arm Auto-Close Dry Run"
-  );
-  armBtn.disabled = !isRunning || autoCloseArmed;
-  armBtn.addEventListener("click", () => handlers.onArmAutoClose?.(false));
-
-  const liveArmBtn = el("button", "primary", "Arm LIVE Auto-Close");
-  liveArmBtn.disabled = !isRunning || autoCloseArmed;
-  liveArmBtn.addEventListener("click", () => handlers.onArmAutoClose?.(true));
-
-  const disarmBtn = el("button", undefined, "Disarm Auto-Close");
-  disarmBtn.disabled = !autoCloseArmed;
-  disarmBtn.addEventListener("click", () => handlers.onDisarmAutoClose?.());
-
-  controls.append(startBtn, stopBtn, refreshBtn, armBtn, liveArmBtn, disarmBtn);
+  controls.append(refreshBtn);
   panel.append(controls);
+
+  const modeDescription: Record<OperatingMode, { text: string; className: string }> = {
+    OFF: {
+      text: "Monitoring is stopped. Nothing is being tracked or watched.",
+      className: "success-text",
+    },
+    CRUISE: {
+      text: "Watching existing positions and your watchlist, sending buy/sell notifications. No orders are placed.",
+      className: "success-text",
+    },
+    AUTOPILOT: {
+      text:
+        state.executionMode === "ARMED_AUTO_CLOSE" && state.autoCloseLive
+          ? "Autopilot is armed. Qualifying positions may be closed automatically, with no confirmation prompts."
+          : "Autopilot is on but not yet armed — see below for what's blocking it.",
+      className: "warn-text",
+    },
+  };
+  panel.append(el("div", modeDescription[state.operatingMode].className, modeDescription[state.operatingMode].text));
+  return panel;
+}
+
+/** Purely a progress display (see strategy/daily-goal.ts) — informational
+ * only, confirmed with the user. Takes already-computed values rather than
+ * importing strategy/ directly, keeping sidepanel.ts as the one place that
+ * combines the audit log with the daily-goal math. */
+export function renderDailyGoalCard(goal: {
+  goalUsd: number | null;
+  totalUsd: number;
+  progressPct: number | null;
+  met: boolean;
+  dailyGoalPct: number;
+}): HTMLElement {
+  const panel = el("section", "panel stack");
+  panel.append(el("h2", undefined, "Daily Goal"));
+  if (goal.goalUsd === null) {
+    panel.append(el("div", "empty-state", "Account equity not yet available — run a scan to populate it."));
+    return panel;
+  }
   panel.append(
-    el(
-      "div",
-      autoCloseArmed ? "warn-text" : "success-text",
-      autoCloseArmed
-        ? state.autoCloseLive
-          ? "LIVE Auto-Close is armed. Current validated CLOSE signals may close Kraken positions automatically."
-          : "Auto-Close is armed in dry-run mode only. It logs close intents but does not click Kraken final confirmation."
-        : "Start Monitoring is monitor-only. It will not execute trades unless Auto-Close is separately armed."
+    row("Goal", `${fmtUsd(goal.goalUsd)} (${goal.dailyGoalPct}% of account equity)`),
+    row("So far today", fmtSignedUsd(goal.totalUsd)),
+    row(
+      "Progress",
+      goal.progressPct !== null ? `${goal.progressPct.toFixed(0)}%${goal.met ? " — goal met" : ""}` : "-"
     )
   );
   return panel;
@@ -566,7 +593,8 @@ export function renderPositionCard(
   pos: TrackedPosition,
   _now: number,
   lotName: string | null = null,
-  handlers?: Pick<ControlHandlers, "onPreviewClose" | "onRequestManualClose">
+  handlers?: Pick<ControlHandlers, "onPreviewClose" | "onRequestManualClose">,
+  signalTier?: SignalTier
 ): HTMLElement {
   const card = el("article", "lot-card");
   const latest = pos.latest;
@@ -579,6 +607,9 @@ export function renderPositionCard(
     el("strong", undefined, lotName ?? "Lot A"),
     pill(decisionLabel(pos.decision), decisionTone(pos.decision))
   );
+  if (signalTier) {
+    header.append(pill(signalTier, signalTierTone(signalTier)));
+  }
   card.append(header);
 
   const grid = el("div", "lot-metrics");
@@ -725,21 +756,14 @@ export function renderPositionsSection(
       el("span", undefined, `${lots.length} lot${lots.length === 1 ? "" : "s"}`)
     );
     market.append(header);
-    lots.forEach((pos, i) => market.append(renderPositionCard(pos, now, lotLabel(i), handlers)));
+    lots.forEach((pos, i) =>
+      market.append(
+        renderPositionCard(pos, now, lotLabel(i), handlers, state.signalStates[pos.symbol]?.tier)
+      )
+    );
     section.append(market);
   }
   return section;
-}
-
-function apiStatusTone(status: MarketDataRow["apiStatus"]): "ok" | "warn" | "bad" | "neutral" {
-  switch (status) {
-    case "OK":
-      return "ok";
-    case "STALE":
-      return "warn";
-    case "ERROR":
-      return "bad";
-  }
 }
 
 function trendTone(trend: MarketDataRow["trend"]): "ok" | "warn" | "neutral" {
@@ -748,45 +772,114 @@ function trendTone(trend: MarketDataRow["trend"]): "ok" | "warn" | "neutral" {
   return "neutral";
 }
 
-function fmtSignedPct(value: number | null): string {
-  return fmtPct(value);
-}
+const WATCHLIST_SYMBOL_PATTERN = /^[A-Z][A-Z0-9]{1,9}$/;
 
-function tradingViewUrl(apiMarket: string): string {
-  const tvSymbol = apiMarket.replace("/", "").toUpperCase();
-  return `https://www.tradingview.com/chart/?symbol=KRAKEN:${encodeURIComponent(tvSymbol)}`;
-}
-
-export function renderInterestedCoinsPanel(state: RuntimeState, now: number): HTMLElement {
+export function renderInterestedCoinsPanel(
+  state: RuntimeState,
+  now: number,
+  handlers?: { onUpdateWatchlist?: (symbols: string[]) => void }
+): HTMLElement {
   const panel = el("section", "panel stack");
   panel.append(el("h2", undefined, "Interested Kraken Coins"));
+
+  const autoTrackedSymbols = [...new Set(activePositions(state).map((p) => p.symbol))].sort();
+  const manualSymbols = state.settings.watchlistCoins.filter(
+    (symbol) => !autoTrackedSymbols.includes(symbol)
+  );
+  const usedSlots = autoTrackedSymbols.length + manualSymbols.length;
+  const remaining = Math.max(0, MAX_WATCHLIST_COINS - usedSlots);
+
   panel.append(
     el(
       "div",
       "muted",
-      "Read-only watchlist for BUY signals only — never auto-bought. Configure up to " +
-        `${MAX_WATCHLIST_COINS} symbols in Settings.`
+      `Tracking ${usedSlots} of ${MAX_WATCHLIST_COINS} slots — never auto-bought, only sends a ` +
+        "notification so you can place a manual order yourself. Symbols with an open position are tracked " +
+        "automatically and don't use up a manual slot."
     )
   );
 
-  const symbols = state.settings.watchlistCoins;
+  if (autoTrackedSymbols.length > 0) {
+    const autoRow = el("div", "watchlist-chip-row");
+    autoRow.append(el("span", "muted", "Auto-tracked (open position):"));
+    for (const symbol of autoTrackedSymbols) autoRow.append(pill(symbol, "neutral"));
+    panel.append(autoRow);
+  }
+
+  if (handlers?.onUpdateWatchlist) {
+    const onUpdateWatchlist = handlers.onUpdateWatchlist;
+    if (manualSymbols.length > 0) {
+      const manageRow = el("div", "watchlist-manage-row");
+      for (const symbol of manualSymbols) {
+        const chip = el("span", "pill neutral watchlist-chip");
+        chip.append(document.createTextNode(symbol));
+        const removeBtn = el("button", "chip-remove", "×");
+        removeBtn.type = "button";
+        removeBtn.setAttribute("aria-label", `Remove ${symbol}`);
+        removeBtn.addEventListener("click", () =>
+          onUpdateWatchlist(manualSymbols.filter((s) => s !== symbol))
+        );
+        chip.append(removeBtn);
+        manageRow.append(chip);
+      }
+      panel.append(manageRow);
+    }
+
+    const addRow = el("div", "watchlist-add-row");
+    const input = document.createElement("input");
+    input.type = "text";
+    input.placeholder = remaining > 0 ? "Add symbol (e.g. SOL)" : `All ${MAX_WATCHLIST_COINS} slots in use`;
+    input.disabled = remaining <= 0;
+    const addBtn = el("button", "small-button", "Add");
+    addBtn.type = "button";
+    addBtn.disabled = remaining <= 0;
+    const errorLine = el("div", "reason-line warn-text");
+    errorLine.hidden = true;
+    const submit = (): void => {
+      const raw = input.value.trim().toUpperCase();
+      if (!raw) return;
+      errorLine.hidden = true;
+      if (!WATCHLIST_SYMBOL_PATTERN.test(raw)) {
+        errorLine.hidden = false;
+        errorLine.textContent = `"${raw}" doesn't look like a valid symbol.`;
+        return;
+      }
+      if (manualSymbols.includes(raw) || autoTrackedSymbols.includes(raw)) {
+        errorLine.hidden = false;
+        errorLine.textContent = `${raw} is already tracked.`;
+        return;
+      }
+      onUpdateWatchlist([...manualSymbols, raw]);
+      input.value = "";
+    };
+    addBtn.addEventListener("click", submit);
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        submit();
+      }
+    });
+    addRow.append(input, addBtn);
+    panel.append(addRow, errorLine);
+  }
+
+  const symbols = manualSymbols;
   if (symbols.length === 0) {
-    panel.append(el("div", "empty-state", "No coins configured yet. Add some in Settings."));
+    panel.append(el("div", "empty-state", "No additional coins configured yet."));
     return panel;
   }
 
   for (const symbol of symbols) {
     const row_ = state.marketData[symbol];
     const signal = state.watchlistSignals[symbol];
+    const tierEntry = state.signalStates[symbol];
     const card = el("article", "market-card");
     const header = el("div", "market-card-header");
-    const confirmed = signal?.signalFiredForThisEpisode ?? false;
     header.append(
       el("strong", undefined, symbol),
-      pill(
-        confirmed ? "BUY SIGNAL" : row_?.trend === "STRONG" ? "Watching" : "No signal",
-        confirmed ? "ok" : row_?.trend === "STRONG" ? "warn" : "neutral"
-      )
+      tierEntry
+        ? pill(tierEntry.tier, signalTierTone(tierEntry.tier))
+        : pill(row_?.trend === "STRONG" ? "Watching" : "No signal", row_?.trend === "STRONG" ? "warn" : "neutral")
     );
     card.append(header);
     if (!row_ || row_.apiStatus !== "OK") {
@@ -805,114 +898,16 @@ export function renderInterestedCoinsPanel(state: RuntimeState, now: number): HT
           ? `${signal.consecutiveClosesAboveSmaFast}/${state.settings.strongTrendConfirmationCloses} closes above SMA7`
           : "Not yet evaluated"
       ),
+      row(
+        "Suggested new buy",
+        row_.atOrAboveSizeCap
+          ? `Already at the ${state.settings.positionSizeCapPct}% cap`
+          : row_.suggestedBuyUsd !== null
+            ? `${fmtUsd(row_.suggestedBuyUsd)}${row_.suggestedBuyUnits !== null ? ` (~${row_.suggestedBuyUnits.toFixed(4)} ${symbol})` : ""}`
+            : "Account equity unavailable"
+      ),
       row("Last checked", fmtAge(row_.lastUpdatedAt, now))
     );
-    panel.append(card);
-  }
-  return panel;
-}
-
-export function renderMarketDataPanel(
-  state: RuntimeState,
-  now: number,
-  handlers?: Pick<ControlHandlers, "onRefreshMarketData">,
-  refreshState: MarketRefreshUiState = { refreshing: null, message: null, error: null }
-): HTMLElement {
-  const panel = el("section", "panel stack");
-  panel.append(el("h2", undefined, "Market Data"));
-
-  const rows = Object.values(state.marketData).sort((a, b) => a.symbol.localeCompare(b.symbol));
-  const apiOk = rows.length > 0 && rows.every((r) => r.apiStatus === "OK");
-  const meta = el("div", "panel-meta");
-  meta.append(
-    el("span", undefined, `Last refreshed ${fmtAge(state.lastPriceUpdateAt, now)}`),
-    el("span", undefined, `Next automatic refresh ${fmtUntil(state.nextMarketRefreshAt, now)}`),
-    el("span", undefined, `Auto-refresh every ${state.settings.marketRefreshMinutes} min`),
-    el(
-      "span",
-      undefined,
-      `Monitoring ${state.monitoringStatus === "RUNNING" ? "Running" : "Stopped"}`
-    ),
-    el("span", undefined, `${rows.length} symbols`),
-    el("span", undefined, apiOk ? "API Healthy" : "API pending/error")
-  );
-  panel.append(meta);
-
-  const allRefreshing = refreshState.refreshing?.kind === "all";
-  const refreshAll = el(
-    "button",
-    "primary",
-    allRefreshing ? "Refreshing..." : "Refresh Positions + Market Data"
-  );
-  refreshAll.disabled = refreshState.refreshing !== null;
-  refreshAll.addEventListener("click", () => handlers?.onRefreshMarketData?.());
-  panel.append(refreshAll);
-  if (refreshState.message) panel.append(el("div", "success-text", refreshState.message));
-  if (refreshState.error) panel.append(el("div", "warn-text", refreshState.error));
-
-  if (rows.length === 0) {
-    panel.append(el("div", "empty-state", "No market data yet."));
-    return panel;
-  }
-
-  const lotsBySymbol = new Map<string, TrackedPosition[]>();
-  for (const pos of activePositions(state)) {
-    const list = lotsBySymbol.get(pos.symbol) ?? [];
-    list.push(pos);
-    lotsBySymbol.set(pos.symbol, list);
-  }
-
-  for (const r of rows) {
-    const lots = lotsBySymbol.get(r.symbol) ?? [];
-    const uiPrices = lots
-      .map((p) => p.latest?.currentPriceUi ?? null)
-      .filter((price): price is number => price !== null);
-    const uiPrice =
-      uiPrices.length > 0
-        ? uiPrices.reduce((sum, price) => sum + price, 0) / uiPrices.length
-        : null;
-    const diffPct =
-      uiPrice !== null && r.currentApiPrice !== null
-        ? ((uiPrice - r.currentApiPrice) / r.currentApiPrice) * 100
-        : null;
-
-    const card = el("article", "market-card");
-    const header = el("div", "market-card-header");
-    const symbolRefreshing =
-      refreshState.refreshing?.kind === "symbol" && refreshState.refreshing.symbol === r.symbol;
-    const refreshOne = el("button", "small-button", symbolRefreshing ? "Refreshing..." : "Refresh");
-    refreshOne.disabled = refreshState.refreshing !== null;
-    refreshOne.addEventListener("click", () => handlers?.onRefreshMarketData?.(r.symbol));
-    const chartLink = el("a", "small-button", "Chart");
-    chartLink.href = tradingViewUrl(r.apiMarket);
-    chartLink.target = "_blank";
-    chartLink.rel = "noopener noreferrer";
-    const headerActions = el("div", "market-actions");
-    headerActions.append(
-      pill(r.apiStatus === "OK" ? "Healthy" : r.apiStatus, apiStatusTone(r.apiStatus)),
-      chartLink,
-      refreshOne
-    );
-    header.append(el("strong", undefined, r.symbol), headerActions);
-    card.append(header);
-    card.append(
-      row("Source", r.source === "DETECTED_POSITION" ? "Detected" : "Watchlist"),
-      row("API market", r.apiMarket),
-      row("Current price", fmtPrice(r.currentApiPrice)),
-      row("Kraken visible price", fmtPrice(uiPrice)),
-      row("API/UI difference", fmtSignedPct(diffPct)),
-      row("Last 1h close", fmtPrice(r.lastCompletedClose)),
-      row("SMA7", fmtPrice(r.smaFast)),
-      row("SMA30", fmtPrice(r.smaSlow)),
-      wrapRow("Trend", pill(r.trend, trendTone(r.trend))),
-      row("Price vs SMA7", fmtSignedPct(r.vsSmaFastPct)),
-      row("Price vs SMA30", fmtSignedPct(r.vsSmaSlowPct)),
-      row("Last completed candle", fmtAge(r.latestCandleTs, now)),
-      row("API data age", fmtAge(r.lastUpdatedAt, now)),
-      row("Candles", String(r.completedCandleCount)),
-      row("Forming candle excluded", r.formingCandleExcluded ? "yes" : "no")
-    );
-    if (r.errorMessage) card.append(el("div", "reason-line warn-text", r.errorMessage));
     panel.append(card);
   }
   return panel;
@@ -1119,7 +1114,8 @@ function controlSummary(label: string, info: OrderFormDiagnosticsReport["buyTabC
  * filled, or submitted. */
 export function renderOrderFormDiagnosticsSection(
   report: OrderFormDiagnosticsReport | null,
-  error: string | null
+  error: string | null,
+  onCopy?: () => void
 ): HTMLElement {
   const panel = el("section", "panel stack diagnostics-panel");
   panel.append(el("h2", undefined, "Order-Form Diagnostics (read-only, not yet a working feature)"));
@@ -1150,6 +1146,13 @@ export function renderOrderFormDiagnosticsSection(
     row("Account equity text", report.accountEquityText ?? "-"),
     row("Account equity parsed", report.accountEquityParsed !== null ? String(report.accountEquityParsed) : "-")
   );
+
+  if (onCopy) {
+    const copyBtn = el("button", undefined, "Copy Sanitized Diagnostics");
+    copyBtn.type = "button";
+    copyBtn.addEventListener("click", onCopy);
+    panel.append(copyBtn);
+  }
 
   if (report.rawPanelTextExcerpt) {
     panel.append(el("div", "section-title", "Raw panel text (sanitized excerpt)"));
@@ -1365,6 +1368,16 @@ function validateSettings(settings: Settings): string[] {
     errors.push("Close verification timeout must be a whole number between 3 and 60 seconds.");
   }
   if (
+    !Number.isFinite(settings.positionSizeCapPct) ||
+    settings.positionSizeCapPct <= 0 ||
+    settings.positionSizeCapPct > 100
+  ) {
+    errors.push("Position size cap must be a percentage between 0 (exclusive) and 100.");
+  }
+  if (!Number.isFinite(settings.dailyGoalPct) || settings.dailyGoalPct < 0) {
+    errors.push("Daily goal percentage must be non-negative.");
+  }
+  if (
     settings.executionWebhookUrl &&
     !isSupportedExecutionWebhookUrl(settings.executionWebhookUrl)
   ) {
@@ -1427,6 +1440,18 @@ export function renderSettingsPanel(state: RuntimeState, handlers: SettingsHandl
     numberInput("expansionFloorAtrBuffer", "Expansion floor ATR buffer", state.settings.expansionFloorAtrBuffer, "0.01"),
     numberInput("deteriorationAtrBreakBuffer", "Deterioration ATR buffer", state.settings.deteriorationAtrBreakBuffer, "0.01"),
     numberInput("expansionFastBreakAtrBuffer", "Expansion fast-break ATR buffer", state.settings.expansionFastBreakAtrBuffer, "0.01"),
+    numberInput(
+      "positionSizeCapPct",
+      "Position size cap (% of account equity)",
+      state.settings.positionSizeCapPct,
+      "0.1"
+    ),
+    el(
+      "div",
+      "muted",
+      "Soft cap used only to size a suggested new buy for watchlist coins — never force-trims an " +
+        "existing holding that has organically grown past it."
+    ),
     el("div", "profit-tiers"),
     row("3% to below 7%", "retain 50%"),
     row("7% to below 15%", "retain 65%"),
@@ -1514,18 +1539,13 @@ export function renderSettingsPanel(state: RuntimeState, handlers: SettingsHandl
         "distinct \"BUY SIGNAL\" push to the same phone notification URL above — never an order. Kraken can " +
         "never auto-buy; you place any order yourself. Leave blank to disable."
     ),
-    el("div", "section-title", "Start Monitoring behavior"),
-    checkboxInput(
-      "startMonitoringWithLiveAutoClose",
-      "Start Monitoring with LIVE Auto-Close",
-      state.settings.startMonitoringWithLiveAutoClose
-    ),
+    el("div", "section-title", "Goal"),
+    numberInput("dailyGoalPct", "Daily goal (% of account equity)", state.settings.dailyGoalPct, "0.01"),
     el(
       "div",
       "muted",
-      "Default OFF. When ON, Start Monitoring shows one live-trading confirmation and, if you accept, " +
-        "arms LIVE Auto-Close automatically once monitoring passes preflight. The separate two-step flow " +
-        "(Start Monitoring, then Arm LIVE Auto-Close) always remains available regardless of this setting."
+      "Informational only — a progress display on the Positions tab. Nothing changes behavior when it's " +
+        "hit or missed."
     ),
     el("div", "section-title", "Developer / testing"),
     row("Watchlist symbols", DEV_WATCHLIST_SYMBOLS.join(", ")),
@@ -1584,10 +1604,11 @@ export function renderSettingsPanel(state: RuntimeState, handlers: SettingsHandl
       autoCloseSignalExpiryMinutes: readNumber(form, "autoCloseSignalExpiryMinutes"),
       closeVerificationTimeoutSeconds: readNumber(form, "closeVerificationTimeoutSeconds"),
       alarmSoundEnabled: readCheckbox(form, "alarmSoundEnabled"),
-      startMonitoringWithLiveAutoClose: readCheckbox(form, "startMonitoringWithLiveAutoClose"),
       executionWebhookUrl: readText(form, "executionWebhookUrl"),
       executionEmailAddress: readText(form, "executionEmailAddress"),
       watchlistCoins: parseWatchlistCoinsInput(readText(form, "watchlistCoins")),
+      positionSizeCapPct: readNumber(form, "positionSizeCapPct"),
+      dailyGoalPct: readNumber(form, "dailyGoalPct"),
     };
     const errors = validateSettings(next);
     if (errors.length > 0) {
