@@ -318,6 +318,16 @@ export interface LiveAutoCloseStats {
   closeTimestamps: number[];
   unresolvedSleepGap: boolean;
   previousExecutionUncertain: boolean;
+  /** Set when a previously ACTIVE position vanishes from parsing entirely
+   * (candidateRowCount drops to 0 while one was expected) while LIVE
+   * Auto-Close was armed. Deliberately sticky like unresolvedSleepGap —
+   * only a fresh explicit arm (resetStats: true) clears it — so Autopilot
+   * cannot silently self-heal back into a "zero positions" cold-start arm
+   * immediately after a real position disappears ambiguously (which could
+   * otherwise let it buy a duplicate position while the original sits
+   * unprotected and untracked). Requires the user to verify Kraken
+   * manually before Autopilot resumes. */
+  parserGapUnresolved: boolean;
 }
 
 export interface AuditLogEntry {

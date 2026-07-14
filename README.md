@@ -394,19 +394,43 @@ their Decision pill, derived from that position's own exit signal.
 **Cruise mode** sends a notification whenever a symbol's tier crosses into
 BUY/STRONG_BUY (an entry candidate) or SELL/STRONG_SELL (an existing
 position turning bearish) — informational only, no order is placed.
-**Autopilot** currently only acts on the sell side (closing existing
-positions via the LIVE Auto-Close pipeline above); it does not yet place
-buy orders — see the note below.
 
-**Buy-side execution is not implemented yet.** Automating a real Buy
-order requires knowing Kraken's actual Buy-tab/quantity-input/submit-button
-markup, which this extension has never inspected (unlike the Close
-dialog, which was calibrated against real DOM evidence before any click
-code was written — see "DOM Diagnostics" below). Settings has a **Run
-Order-Form Diagnostics** button that reads (never clicks) the Buy panel
-and your account-equity display; running it once against your real,
-logged-in Buy tab is the prerequisite for a future pass to add real
-buy-order automation.
+**Autopilot places real buy and sell orders, end to end, with no
+per-trade confirmation.** Every cycle it re-evaluates each watchlist
+symbol's SMA7/SMA30-based signal tier and, for a symbol at BUY/STRONG_BUY
+with no existing position and room under the position-size cap, opens a
+market buy (`src/content/buy-preview.ts`, `processAutopilotBuys` in
+`service-worker.ts`) — at most one new buy per cycle. Existing positions
+are still evaluated by the same exit-rule engine as before and closed the
+same way (`processLiveAutoClose`) whenever the strategy says `CLOSE`. Both
+paths click all the way through Kraken's own confirmation modal; nothing
+prompts the user mid-trade.
+
+**Arming works from a cold start (zero open positions), as long as at
+least one watchlist coin is configured** — arming used to require an
+already-open position, which made Autopilot's buy path unreachable on a
+fresh account; that requirement was relaxed to "an existing position to
+protect, or a watchlist coin to consider buying." If a previously-tracked
+position ever disappears from parsing unexpectedly (not a legitimate
+sell — a real position that was open a moment ago and is now simply
+absent from the page), Autopilot disarms and **stays disarmed** even
+across its own self-heal retries, specifically so it can't misread that
+ambiguous state as "zero positions, safe to buy into" and end up opening
+a duplicate position while the original sits untracked. That specific
+disarm requires an explicit restart of Autopilot (off, then on) after you
+verify the account on Kraken directly — it will not silently resume on
+its own like the other auto-pause/auto-resume conditions do.
+
+**Buy path has less live-execution history than the sell path.**
+Automating a real Buy order required knowing Kraken's actual
+Buy-tab/quantity-input/submit-button markup; that was captured via
+Settings' **Run Order-Form Diagnostics** button (reads, never clicks, the
+Buy panel and account-equity display) before any click code was written,
+the same discipline used for the Close dialog. The close/sell path has
+been exercised across several real armed sessions; the buy path is
+unit/fixture-tested against real captured markup but has far less
+live-account mileage — watch its first few live autopilot buys in person
+before trusting it fully unattended.
 
 **Settings → Goal → Daily goal** (default 0.25% of account equity) is a
 pure progress display on the Positions tab — realized P/L from today's

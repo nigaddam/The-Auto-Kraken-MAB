@@ -35,6 +35,7 @@ export function freshRuntimeState(): RuntimeState {
       closeTimestamps: [],
       unresolvedSleepGap: false,
       previousExecutionUncertain: false,
+      parserGapUnresolved: false,
     },
     consecutiveScanFailures: 0,
     monitorStalledSince: null,
@@ -72,12 +73,14 @@ export function migrateState(raw: unknown): RuntimeState {
     autoCloseDryRunIntents: state.autoCloseDryRunIntents ?? {},
     livePreflight: state.livePreflight ?? null,
     closeExecution: state.closeExecution ?? null,
-    liveAutoCloseStats: state.liveAutoCloseStats ?? {
-      armedSessionStartedAt: null,
-      closesThisSession: 0,
-      closeTimestamps: [],
-      unresolvedSleepGap: false,
-      previousExecutionUncertain: false,
+    liveAutoCloseStats: {
+      armedSessionStartedAt: state.liveAutoCloseStats?.armedSessionStartedAt ?? null,
+      closesThisSession: state.liveAutoCloseStats?.closesThisSession ?? 0,
+      closeTimestamps: state.liveAutoCloseStats?.closeTimestamps ?? [],
+      unresolvedSleepGap: state.liveAutoCloseStats?.unresolvedSleepGap ?? false,
+      previousExecutionUncertain: state.liveAutoCloseStats?.previousExecutionUncertain ?? false,
+      // New field: older persisted state predates this and won't have it.
+      parserGapUnresolved: state.liveAutoCloseStats?.parserGapUnresolved ?? false,
     },
     consecutiveScanFailures: state.consecutiveScanFailures ?? 0,
     monitorStalledSince: state.monitorStalledSince ?? null,

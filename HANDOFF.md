@@ -1371,3 +1371,81 @@ Confirm-Buy-clicks-through MODAL_VALIDATED).
 
 All four gates pass: `npm run typecheck`, `npm run lint`, `npm test`
 (268/268, up from 264), `npm run build`.
+
+## 24. Addendum: fixed a real arming deadlock that made Autopilot's buy path unreachable from a cold start (this session)
+
+The user asked, directly, whether Autopilot is "completely done" — able to
+buy and sell a tracked watchlist fully on its own with no human
+interaction in between. Reading the actual execution path (not the
+docs) surfaced a genuine, previously-undiscovered bug: `canArmLiveAutoClose()`
+(`service-worker.ts`) hard-blocked arming whenever `activeAutoClosePositions(state).length === 0`
+("No auto-close-eligible active LONG positions exist"), and
+`processAutopilotBuys()` only ever runs once armed. Result: **starting
+from zero open Kraken positions, Autopilot could never arm and therefore
+could never place its first buy** — it would just notify "Autopilot
+paused" every cycle forever. This was never caught because every prior
+live-armed session (addenda 19, 21) started with real positions already
+open (XPL/JTO/TIA); `tests/service-worker-continuity.test.ts` even had a
+comment treating the zero-position block as intentional. README.md was
+also stale here — it still claimed "buy-side execution is not implemented
+yet," contradicting the buy automation actually shipped in addendum 23.
+
+**Fix, `canArmLiveAutoClose()`:**
+1. Removed the standalone `lastCandidateRowCount <= 0` blocker — zero
+   candidate rows is the ordinary, safe state for an account with no open
+   positions (`positionsTableReadable` already confirms the section
+   itself parsed correctly; row count is a separate, non-safety signal).
+2. Changed the active-position requirement from "must have ≥1 active
+   position" to "must have ≥1 active position **or** ≥1 watchlist coin
+   configured" — only blocks when there is truly nothing to act on.
+
+**A second, subtler gap found while testing the fix:** `processScanResult`'s
+ongoing per-cycle health check also treated `candidateRowCount === 0` as
+automatic "parser degraded, disarm" — which, combined with fix #2 above,
+created a new risk: if a *real* tracked position ever silently vanished
+from parsing (Kraken markup change, not a legitimate close), the disarm
+would fire correctly, but Autopilot's own end-of-cycle self-heal
+(`tryAutopilotArm`, called unconditionally after every `runScanCycle`)
+would then immediately reinterpret "0 active positions" as a legitimate
+cold start and re-arm within the same or next cycle — reaching
+`processAutopilotBuys` and potentially opening a *second*, duplicate
+position while the original sat unprotected and untracked, now invisible
+to every safety rule in the strategy engine. Caught by writing a
+regression test for exactly this scenario before considering the fix
+done.
+
+**Fix for that gap:** the zero-row-while-previously-active case is now
+distinguished from "genuinely zero positions" (`hadActivePositionsBeforeThisScan`,
+computed from the pre-scan state) and handled separately: it still
+disarms, but also sets a new sticky flag, `RuntimeState.liveAutoCloseStats.parserGapUnresolved`
+(`src/shared/types.ts`), which `canArmLiveAutoClose` treats as a hard
+blocker — including against Autopilot's own self-heal. Deliberately
+modeled on the existing `unresolvedSleepGap` field's lifecycle: it only
+clears on an explicit fresh arm (`resetStats: true` — i.e. the user
+toggling Autopilot off then on) or a genuine monitoring restart, never by
+itself on the next "looks fine now" scan. This mirrors the project's
+existing philosophy for other ambiguous/dangerous states (UNCERTAIN close
+verification, `CHANGED` position status) — require a human to look,
+don't silently resume. `migrations.ts` was updated so existing persisted
+state without this new field defaults it to `false` on load.
+
+**Also updated:** README.md's "Watchlist signal tiers" section, replacing
+the stale "buy-side execution is not implemented yet" claim with an
+accurate description of what Autopilot actually does end-to-end today,
+including this fix's cold-start-arming and sticky-disarm behavior.
+
+**Testing:** `tests/service-worker-continuity.test.ts` gained 2 new
+integration tests against the real service-worker module (not just unit
+tests of the pure logic): one proving arming now succeeds from zero
+positions once a watchlist coin is configured (`stubWorkingMarketDataFetch`,
+a new realistic OHLC/Ticker fetch mock, was added to this file since the
+existing "network disabled" mock can't exercise a real successful arm);
+one proving a previously-active position vanishing still disarms *and
+stays disarmed* across a subsequent self-heal cycle, with `parserGapUnresolved`
+observably `true`. Writing these against the real integration harness
+(not a narrower unit test) is what surfaced the self-heal
+duplicate-position risk in the first place — a narrower test would have
+only proven the initial disarm fired, not that it stuck.
+
+All four gates pass: `npm run typecheck`, `npm run lint`, `npm test`
+(271/271, up from 268), `npm run build`.

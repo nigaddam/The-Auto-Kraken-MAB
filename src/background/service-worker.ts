@@ -201,6 +201,7 @@ async function resetToSafeDefaultsOnRestart(): Promise<void> {
       unresolvedSleepGap: false,
       previousExecutionUncertain:
         hadInterruptedExecution || before.liveAutoCloseStats.previousExecutionUncertain,
+      parserGapUnresolved: false,
     },
   }));
 
@@ -682,6 +683,10 @@ async function canArmLiveAutoClose(): Promise<LiveAutoClosePreflightResult> {
   }
   if (state.liveAutoCloseStats.unresolvedSleepGap)
     blockers.push("A sleep/interruption gap is unresolved.");
+  if (state.liveAutoCloseStats.parserGapUnresolved)
+    blockers.push(
+      "A previously-tracked position disappeared from parsing unexpectedly — verify manually on Kraken, then restart Autopilot."
+    );
   if (state.keepAwakeStatus !== "ACTIVE") blockers.push("Keep-awake is not active.");
 
   const tab = await findKrakenTab();
@@ -702,8 +707,15 @@ async function canArmLiveAutoClose(): Promise<LiveAutoClosePreflightResult> {
   if (page?.sessionState !== "LOGGED_IN")
     blockers.push(`Kraken session is ${page?.sessionState ?? "UNKNOWN"}.`);
   if (!page?.positionsTableReadable) blockers.push("Positions table is not readable.");
-  if ((state.lastCandidateRowCount ?? 0) <= 0)
-    blockers.push("No actionable LONG position rows were found.");
+  // Deliberately no standalone "candidateRowCount <= 0" blocker here.
+  // Zero candidate rows is the ordinary, safe state for an account with no
+  // open positions yet (positionsTableReadable already confirms the
+  // section itself was found and is structurally sound) — Autopilot's
+  // buy-only cold start depends on arming being reachable in that state.
+  // The dangerous variant (real positions silently vanish from parsing)
+  // is guarded separately below and in processScanResult's ongoing
+  // parserDegraded check, both of which key off *previously active*
+  // positions rather than raw row count.
   if (!freshEnough(state.lastPositionScanAt, maxAgeMs, checkedAt)) {
     blockers.push("Latest position scan is stale.");
   }
@@ -721,7 +733,18 @@ async function canArmLiveAutoClose(): Promise<LiveAutoClosePreflightResult> {
   state = await getState();
 
   const active = activeAutoClosePositions(state);
-  if (active.length === 0) blockers.push("No auto-close-eligible active LONG positions exist.");
+  // Autopilot must be able to arm from a cold start with zero open
+  // positions — its job now includes *opening* the first one
+  // (processAutopilotBuys only ever runs while armed). Only block when
+  // there is truly nothing an arm could act on: no existing LONG position
+  // to protect AND no watchlist coin configured to buy. Requiring an
+  // active position unconditionally (the old behavior) made the buy path
+  // unreachable on a fresh account — see HANDOFF.md.
+  if (active.length === 0 && state.settings.watchlistCoins.length === 0) {
+    blockers.push(
+      "No active LONG positions to protect and no watchlist coins configured to buy."
+    );
+  }
   for (const pos of active) {
     const marketProblem = marketRowHealthyForPosition(state, pos, checkedAt, maxAgeMs);
     if (marketProblem) blockers.push(marketProblem);
@@ -820,6 +843,7 @@ async function handleArmAutoClose(
           closeTimestamps: [],
           unresolvedSleepGap: false,
           previousExecutionUncertain: false,
+          parserGapUnresolved: false,
         }
       : s.liveAutoCloseStats,
   }));
@@ -871,6 +895,7 @@ async function handleStartMonitoring(): Promise<void> {
     liveAutoCloseStats: {
       ...s.liveAutoCloseStats,
       unresolvedSleepGap: false,
+      parserGapUnresolved: false,
     },
   }));
   await startPolling(next.settings.pollMinutes);
@@ -2049,11 +2074,24 @@ async function processScanResult(
   }
   await broadcastState(next);
   if (next.executionMode === "ARMED_AUTO_CLOSE" && next.autoCloseLive) {
+    // A previously-tracked ACTIVE position silently vanishing from parsing
+    // (candidateRowCount dropping to 0 while one was expected) is a real
+    // parser-health red flag — reconcilePositions would otherwise quietly
+    // mark it CLOSED just because it wasn't matched this scan. But zero
+    // rows on its own is also the ordinary, safe state for Autopilot's
+    // buy-only cold start (no open positions yet) or right after its last
+    // position closes — that must not be treated as degradation, or
+    // Autopilot could never arm/buy from zero positions. Only flag it when
+    // we had a real ACTIVE position going into this scan.
+    const hadActivePositionsBeforeThisScan = Object.values(state.positions).some(
+      (pos) => pos.status === "ACTIVE"
+    );
+    const positionsVanished = scan.candidateRowCount === 0 && hadActivePositionsBeforeThisScan;
     const parserDegraded =
       !scan.pageHealth.propPageDetected ||
       !scan.pageHealth.positionsTableReadable ||
       scan.pageHealth.sessionState !== "LOGGED_IN" ||
-      scan.candidateRowCount === 0;
+      positionsVanished;
     const changed = Object.values(positions).find(
       (pos) => pos.status === "CHANGED" || Boolean(pos.autoCloseDisabledReason)
     );
@@ -2062,7 +2100,26 @@ async function processScanResult(
       .map((pos) => marketRowHealthyForPosition(next, pos, now, maxAgeMs))
       .find((problem): problem is string => problem !== null);
     if (parserDegraded) {
-      await disarmLiveAutoClose("Parser or page health degraded while LIVE Auto-Close was armed.");
+      if (positionsVanished) {
+        // Deliberately does not self-heal like the other disarm branches
+        // below: a previously-tracked position disappearing from parsing
+        // is ambiguous (real parser breakage vs. a legitimate external
+        // close) and must not be silently reinterpreted as "zero positions,
+        // safe to arm for buying" on the very next cycle — that could let
+        // Autopilot buy a duplicate position while the original sits
+        // unprotected and untracked. parserGapUnresolved blocks re-arming
+        // (including Autopilot's self-heal) until an explicit fresh arm.
+        const flagged = await updateState((s) => ({
+          ...s,
+          liveAutoCloseStats: { ...s.liveAutoCloseStats, parserGapUnresolved: true },
+        }));
+        await broadcastState(flagged);
+        await disarmLiveAutoClose(
+          "A previously-tracked position disappeared from parsing while LIVE Auto-Close was armed. Verify manually on Kraken, then restart Autopilot."
+        );
+      } else {
+        await disarmLiveAutoClose("Parser or page health degraded while LIVE Auto-Close was armed.");
+      }
       return;
     }
     if (changed) {

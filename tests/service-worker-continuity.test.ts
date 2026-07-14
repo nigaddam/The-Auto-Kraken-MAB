@@ -10,6 +10,45 @@
  * service-worker.ts has always been treated in this project.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { DEFAULT_SETTINGS } from "../src/shared/constants";
+
+function makeOhlcResponse() {
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const intervalSeconds = 60 * 60;
+  const rows: [number, string, string, string, string, string, string, number][] = [];
+  // Comfortably above evaluatePositions' own strategy-validity requirement
+  // (SMA90 + slope lookback + ATR period, currently >100 completed
+  // candles) as well as buildMarketDataTable's smaller slowSma+1 minimum.
+  for (let i = 150; i >= 1; i--) {
+    rows.push([nowSeconds - i * intervalSeconds, "50000", "50100", "49900", "50000", "50000", "1000", 5]);
+  }
+  rows.push([nowSeconds - 60, "50000", "50000", "50000", "50000", "50000", "10", 1]); // forming candle
+  return { error: [], result: { XBTUSD: rows, last: nowSeconds } };
+}
+
+function makeTickerResponse() {
+  return { error: [], result: { XBTUSD: { c: ["50000.0", "1.0"] } } };
+}
+
+/** A fetch mock that succeeds for any Kraken public OHLC/Ticker request
+ * (used by tests that need buildMarketDataTable to resolve real rows
+ * instead of the "network disabled" rejection the other describe blocks
+ * use to keep loop-mechanics tests fast and deterministic). */
+function stubWorkingMarketDataFetch(): void {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn((url: string | URL) => {
+      const u = url.toString();
+      if (u.includes("/OHLC")) {
+        return Promise.resolve(new Response(JSON.stringify(makeOhlcResponse()), { status: 200 }));
+      }
+      if (u.includes("/Ticker")) {
+        return Promise.resolve(new Response(JSON.stringify(makeTickerResponse()), { status: 200 }));
+      }
+      return Promise.reject(new Error(`unexpected fetch in test: ${u}`));
+    })
+  );
+}
 
 interface AlarmInfo {
   periodInMinutes?: number;
@@ -166,6 +205,30 @@ function createChromeMock() {
       scanResponder = fn;
     },
   };
+}
+
+/** Polls GET_STATE with real (not fake) short delays until `predicate`
+ * passes or `timeoutMs` elapses. Needed for scenarios whose async chain
+ * runs a real fetch()/Response.json() (e.g. arming with a working market
+ * data mock) — that chain can take more actual event-loop ticks to settle
+ * than a fixed-count microtask flush accounts for, so a single immediate
+ * GET_STATE right after the triggering message can race ahead of it. */
+async function waitForState(
+  harness: { sendMessage: (message: unknown) => Promise<unknown> },
+  predicate: (state: Record<string, unknown>) => boolean,
+  timeoutMs = 3000
+): Promise<Record<string, unknown>> {
+  const deadline = Date.now() + timeoutMs;
+  let last: Record<string, unknown> = {};
+  while (Date.now() < deadline) {
+    const response = (await harness.sendMessage({ type: "GET_STATE" })) as {
+      state: Record<string, unknown>;
+    };
+    last = response.state;
+    if (predicate(last)) return last;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  return last;
 }
 
 async function flushMicrotasks(times = 300): Promise<void> {
@@ -462,11 +525,117 @@ describe("operating mode", () => {
     };
     expect(after.state.operatingMode).toBe("AUTOPILOT");
     expect(after.state.monitoringStatus).toBe("RUNNING");
-    // Zero positions in this harness means canArmLiveAutoClose always
-    // blocks — Autopilot must not falsely claim to be armed.
+    // Zero positions AND zero watchlist coins configured in this harness
+    // means there is truly nothing to arm for — canArmLiveAutoClose still
+    // blocks in that specific case, and Autopilot must not falsely claim
+    // to be armed. (Zero positions *alone*, with a watchlist configured,
+    // must now succeed — see the dedicated cold-start test below.)
     expect(after.state.autoCloseLive).toBe(false);
     expect(after.state.autopilotReArmFailedSince).not.toBeNull();
     expect(harness.notifications.some((n) => /Autopilot paused/i.test(n.title))).toBe(true);
+  });
+
+  it("arms LIVE from a cold start (zero open positions) as long as watchlist coins are configured", async () => {
+    stubWorkingMarketDataFetch();
+    await harness.sendMessage({
+      type: "UPDATE_SETTINGS",
+      settings: { ...DEFAULT_SETTINGS, watchlistCoins: ["BTC"] },
+    });
+
+    await harness.sendMessage({ type: "SET_OPERATING_MODE", mode: "AUTOPILOT" });
+    const after = await waitForState(harness, (s) => s.executionMode === "ARMED_AUTO_CLOSE");
+    expect(after.operatingMode).toBe("AUTOPILOT");
+    expect(after.executionMode).toBe("ARMED_AUTO_CLOSE");
+    expect(after.autoCloseLive).toBe(true);
+    expect(harness.notifications.some((n) => /Autopilot paused/i.test(n.title))).toBe(false);
+  });
+
+  it("still disarms when a previously-active position vanishes from parsing with zero rows (real parser degradation, not a cold start)", async () => {
+    stubWorkingMarketDataFetch();
+    await harness.sendMessage({
+      type: "UPDATE_SETTINGS",
+      settings: { ...DEFAULT_SETTINGS, watchlistCoins: ["BTC"] },
+    });
+
+    // Arm with one real ACTIVE position present, so arming succeeds via
+    // the normal (non-cold-start) path.
+    harness.setScanResponder(() => ({
+      type: "POSITIONS_SCAN_RESULT",
+      positions: [
+        {
+          symbol: "BTC",
+          side: "LONG",
+          entryPrice: 50000,
+          currentPriceUi: 50000,
+          valueUsd: 500,
+          upnl: 0,
+          netPnl: 0,
+          leverage: 1,
+          tpSlText: null,
+        },
+      ],
+      pageHealth: {
+        checkedAt: Date.now(),
+        propPageDetected: true,
+        accountMarkerDetected: true,
+        sessionState: "LOGGED_IN",
+        positionsTableReadable: true,
+        loginFormDetected: false,
+        sessionExpiredModalDetected: false,
+        captchaDetected: false,
+        twoFaDetected: false,
+        deviceApprovalDetected: false,
+      },
+      candidateRowCount: 1,
+      rowDiscoveryMethod: "SEMANTIC_ROLES",
+    }));
+    await harness.sendMessage({ type: "SET_OPERATING_MODE", mode: "AUTOPILOT" });
+    const armed = await waitForState(harness, (s) => s.autoCloseLive === true);
+    expect(armed.autoCloseLive).toBe(true);
+
+    // Now the position vanishes from parsing entirely (row discovery
+    // returning nothing, as if Kraken's markup broke) while it was still
+    // genuinely open a moment ago — this must still disarm, unlike the
+    // legitimate cold-start case above.
+    harness.setScanResponder(() => ({
+      type: "POSITIONS_SCAN_RESULT",
+      positions: [],
+      pageHealth: {
+        checkedAt: Date.now(),
+        propPageDetected: true,
+        accountMarkerDetected: true,
+        sessionState: "LOGGED_IN",
+        positionsTableReadable: true,
+        loginFormDetected: false,
+        sessionExpiredModalDetected: false,
+        captchaDetected: false,
+        twoFaDetected: false,
+        deviceApprovalDetected: false,
+      },
+      candidateRowCount: 0,
+      rowDiscoveryMethod: "NONE",
+    }));
+    await harness.fireAlarm("kraken-guard-poll");
+
+    const after = await waitForState(harness, (s) => s.autoCloseLive === false);
+    expect(after.autoCloseLive).toBe(false);
+    expect(
+      harness.notifications.some(
+        (n) => /disappeared from parsing/i.test(n.message) || /disappeared from parsing/i.test(n.title)
+      )
+    ).toBe(true);
+
+    // The sticky guard must survive Autopilot's own end-of-cycle self-heal
+    // attempt (already fired once, automatically, by the same
+    // runScanCycle() that just disarmed) and another full poll cycle after
+    // that — it must not silently re-arm into a "cold start" just because
+    // active positions are now 0.
+    await harness.fireAlarm("kraken-guard-poll");
+    const stillDisarmed = (await harness.sendMessage({ type: "GET_STATE" })) as {
+      state: { autoCloseLive: boolean; liveAutoCloseStats: { parserGapUnresolved: boolean } };
+    };
+    expect(stillDisarmed.state.autoCloseLive).toBe(false);
+    expect(stillDisarmed.state.liveAutoCloseStats.parserGapUnresolved).toBe(true);
   });
 
   it("does not repeat the 'waiting to arm' notification every cycle while still blocked", async () => {
